@@ -102,5 +102,7 @@ struct { uint32_t magic, failed, pending; } bootguard __attribute__((section(".n
 #endif
 
 /* -------------------------------------------------------------- app --- */
+#include "nes.c"                 /* the NES chip core (seam B: tests/nes_test.c) */
+#include "player.c"              /* tracks -> chip register states */
 #include "app.c"
 #include "main.c"

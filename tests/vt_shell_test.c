@@ -1,7 +1,9 @@
 /* SPDX-License-Identifier: GPL-3.0-only
  * V-Track: Copyright (C) 2026 Manuel Rubin */
 /* The V-Track app shell on the simulated SMK-37 (seam A, tests/vt_sim.h): it starts into a screen showing the name,
- * silent; a key played, the other controls and USB MIDI in change nothing (MIDI in is taken, never refused); the LEDs stay dark; the flash is not written.
+ * silent; a key played (it sounds: tests/vt_note_test.c) leaves the screen and the LEDs as they are; the other
+ * controls and USB MIDI in change nothing (MIDI in is taken, never refused); the LEDs stay dark; the flash is not
+ * written.
  *   tests/vt_shell_test [OUT_DIR]   (OUT_DIR: the screen as shell.ppm) */
 #include "vt_sim.h"
 
@@ -63,8 +65,7 @@ int main(int argc, char **argv)
     sim_run_ms(250);
     sim_key(17, 0);
     sim_run_ms(250);
-    a = sim_audio(&frames);
-    check(frames >= 44100u * 450u / 1000u && silent(a, frames), "a key played: still silent");
+    sim_audio(&frames);                  /* (what it played: tests/vt_note_test.c) */
     check(sim_screen_text("V-Track"), "a key played: the screen still shows V-Track");
     check(leds_dark(), "a key played: the LEDs stay dark");
     check(sim_midi_out(pkts, 16) == 0, "a key played: no MIDI out");

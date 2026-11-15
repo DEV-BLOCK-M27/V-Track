@@ -7,7 +7,10 @@
 # DEVICE (seam A, tests/vt_sim.h): the firmware (firmware/src/vtrack.c) on a simulated SMK-37: input events and
 #                   elapsed time in; audio, the screen, the pad and button LEDs, MIDI out and the flash store out.
 #                   tests/vt_shell_test.c: the app shell (starts into the V-Track screen, silent, LEDs dark, no
-#                   flash written); the screen in build/host/shell.ppm.
+#                   flash written); the screen in build/host/shell.ppm. tests/vt_note_test.c: a key plays track 1,
+#                   NES Pulse 1, at the 2A03's pitch, one note at a time; a held C4 in build/host/note.wav.
+# NES chip core (seam B, tests/nes_test.c): register states in, samples out: duty waveforms, period -> frequency,
+#                   no aliasing on high notes.
 # Storage (tests/storage_test.c): A/B objects, torn writes. SMK flash map (tests/smk_flash_test.c): the allow-lists
 #                   never reach the protected ranges (head, BTIF / USRTRIM, USR, key_mac); the store owner tag
 #                   (tests/smk_owner_test.c).
@@ -96,8 +99,15 @@ run "update loader, SMK-37 Pro: app area 0x4000-0x9CFFF, protected ranges untouc
 # seam A: the device on the simulated SMK-37
 VT="-Ibuild/gen -Ifirmware/src -Ifirmware/hal -Itests"
 $CC $VT -o "$OUT/vt_shell_test" tests/vt_shell_test.c
-run "DEVICE: the app shell boots into the V-Track screen; a key, silence, dark LEDs, no flash written" \
+run "DEVICE: the app shell boots into the V-Track screen; silence, dark LEDs, no flash written" \
     "$OUT/vt_shell_test" "$OUT"
+$CC $VT -o "$OUT/vt_note_test" tests/vt_note_test.c -lm
+run "DEVICE: a key plays track 1 (NES Pulse 1) at the 2A03's pitch while held, one note at a time" \
+    "$OUT/vt_note_test" "$OUT"
+
+# seam B: the NES chip core alone
+$CC -o "$OUT/nes_test" tests/nes_test.c -lm
+run "NES chip core: duty waveforms, period -> NTSC frequency, no aliasing on high notes" "$OUT/nes_test"
 
 # the display code (firmware/src/gfx.c)
 $CC -w -Ibuild/gen -Ifirmware/src -o "$OUT/theme_test" tests/theme_test.c -lm
@@ -137,6 +147,10 @@ else
     run "ASan/UBSan: SMK-37 store owner tag" "$A/smk_owner_test"
     $SCC $VT -o "$A/vt_shell_test" tests/vt_shell_test.c
     run "ASan/UBSan: DEVICE, the app shell" "$A/vt_shell_test"
+    $SCC $VT -o "$A/vt_note_test" tests/vt_note_test.c -lm
+    run "ASan/UBSan: DEVICE, a note on track 1" "$A/vt_note_test"
+    $SCC -o "$A/nes_test" tests/nes_test.c -lm
+    run "ASan/UBSan: NES chip core" "$A/nes_test"
 fi
 
 run "target cost of the ISRs (pi32v2 disassembly)" python3 tests/target_budget.py build/felucca.dis tests/target_budget.txt

@@ -16,6 +16,7 @@ import sys
 
 FUNCS = ["fm1_alnk0_irq", "fm1_timer5_irq",           # the audio ISR (audio.c, the app's sound inlined); TIMER5: the
                                                     # key / LED scan (hal/smk_input.h) and the USB poll (main.c)
+         "nes__step",                               # the NES chip core: one band-limited step (nes.c), per edge
          "uac_tap48"]                               # the USB audio input at 48 kHz: the 44.1 -> 48 resampler (usb.c)
 # absent from some builds: skipped when absent, checked against these when present
 OPTIONAL = {"uac_tap48": 504}           # (absent from a FELUCCA_UAC_48K=0 or FELUCCA_UAC=0 build)
