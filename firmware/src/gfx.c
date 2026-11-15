@@ -648,6 +648,36 @@ static int32_t cv_text_in(int32_t x0, int32_t y, int32_t w, const aafont_t *f, c
     return cv_text_on(x0 + ink_in(f, s, w), y, f, s, fg, bg);
 }
 
+/* monospaced: each character's advance centred in a cell pitch px wide, from x on (a tracker's columns: "C-4" and
+ * "..." take the same width); one text for the hooks. Returns the x past the last cell. */
+static int32_t cv_text_mono(int32_t x, int32_t y, const aafont_t *f, const char *s, uint16_t fg, uint16_t bg,
+                            int32_t pitch)
+{
+    const uint16_t *rv = ramp(fg, bg);
+    const char *s0 = s;
+    int32_t b[4], x0 = 0x7FFF, y0 = 0x7FFF, x1 = -0x7FFF, y1 = -0x7FFF;
+    char c[2] = {0, 0};
+    for (; *s; s++, x += pitch) {
+        c[0] = *s;
+        text_run(x + HALF_UP(pitch - text_w(f, c)), y, f, c, rv, b);
+        if (b[2] > b[0]) {
+            if (b[0] < x0) x0 = b[0];
+            if (b[2] > x1) x1 = b[2];
+            if (GFX_HOOKS && b[1] < y0) y0 = b[1];
+            if (GFX_HOOKS && b[3] > y1) y1 = b[3];
+        }
+    }
+    if (GFX_HOOKS && x1 > x0) {
+        GFX_HOOK_PEN(y, f);              /* (cut by the canvas: flag 2, as cv_text_flags) */
+        GFX_HOOK_TEXT(x0, y0 + cv_oy, x1, y1 + cv_oy, s0,
+                      x0 < 0 || x1 > (int32_t)cv_w || y0 + cv_oy < cv_cy0 || y1 + cv_oy > cv_cy1 ? 2u : 0u);
+    }
+    (void)s0;
+    (void)y0;
+    (void)y1;
+    return x;
+}
+
 /* s into d (n bytes), at most maxw px wide: never a smaller font, the end ellipsised. 1 = cut */
 static int text_fit(char *d, uint32_t n, const char *s, const aafont_t *f, int32_t maxw)
 {

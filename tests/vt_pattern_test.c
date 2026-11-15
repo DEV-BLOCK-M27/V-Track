@@ -197,7 +197,7 @@ int main(int argc, char **argv)
     tap(8);
 
     /* the screen: the rows of track 1 */
-    check(sim_screen_text("00") && sim_screen_text("0F") && !sim_screen_text("10"), "the screen lists rows 00 to 0F");
+    check(sim_screen_text("00") && sim_screen_text("0C") && !sim_screen_text("0D"), "the screen lists rows 00 to 0C");
     check(sim_screen_text("C-4") && sim_screen_text("E-4") && sim_screen_text("G-4") && sim_screen_text("---") &&
               sim_screen_text("===") && sim_screen_text("..."),
           "the screen shows C-4 E-4 G-4 --- === and empty rows (...)");
@@ -317,9 +317,13 @@ int main(int argc, char **argv)
     }
     button(SMK_BTN_SEQ_REC);
     sim_run_ms(100);
-    check(sim_screen_text("120 BPM") && sim_screen_text("NES \xB7 NOISE") && sim_screen_text("C-6") &&
-              !sim_screen_text("E-4"),
-          "track 4 selected: the screen lists its rows (C-6 on row 2), 120 BPM");
+    {
+        char line[128];
+        sim_screen_line("01", line, sizeof line);
+        check(sim_screen_text("120 BPM") && sim_screen_text("NES \xB7 NOISE") &&
+                  !strcmp(line, "01 C-6 .. . ... E-4 ... ..."),
+              "track 4 selected: the screen lists its rows (C-6 on row 2, track 1's E-4 beside it), 120 BPM");
+    }
     a = left(&n);
     free(a);
     button(SMK_BTN_SEQ_PLAY);

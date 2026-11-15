@@ -26,6 +26,11 @@
  *   sim_audio(&frames)        stereo frames (L R interleaved, 24-bit) rendered since the last call
  *   sim_frame()               the screen: 240 x 240 RGB565 (row by row)
  *   sim_screen_text(s)        1 if the text s is on the screen now (drawn and not drawn over since)
+ *   sim_screen_box(s, box)    .. and its ink box (x0 y0 x1 y1, x1 y1 past it)
+ *   sim_screen_line(s, out, n)  the texts on text s's line (their centres within its rows), from s rightwards, left
+ *                             to right, space-separated, into out; 0 if s is not on the screen
+ *   sim_screen_tidy(why, n)   1 if no text on the screen is cut (by its canvas, an ellipsis, the screen's edge) or
+ *                             overlaps another; why: the first that is
  *   sim_pad_led(p)            pad p's colour as last sent to the pads, 0xRRGGBB
  *   sim_button_led(b)         1 if button b's LED is lit
  *   sim_flash(), SIM_FLASH_SIZE   the flash chip's bytes; sim_flash_writes() / sim_flash_refused(): erases and
@@ -97,20 +102,21 @@ static void fm1_irq_enable_all(void) {}
 /* the text on the screen, read back from the drawing code (gfx.c's hooks): what is drawn on the canvas waits for its
  * blit; a blit or a fill takes away every text it draws over */
 #define SIM_TXT_MAX 256
-typedef struct { int32_t x0, y0, x1, y1; char s[48]; } sim_txt_t;
+typedef struct { int32_t x0, y0, x1, y1; uint32_t cut; char s[48]; } sim_txt_t;
 static sim_txt_t sim_txt[SIM_TXT_MAX], sim_cv_txt[SIM_TXT_MAX];
 static uint32_t sim_ntxt, sim_cv_ntxt;
 static int32_t sim_blit_x = -1, sim_blit_y, sim_blit_r0;
-static void sim__cv_text(int32_t x0, int32_t y0, int32_t x1, int32_t y1, const char *s)
+static void sim__cv_text(int32_t x0, int32_t y0, int32_t x1, int32_t y1, const char *s, uint32_t flags)
 {
     sim_txt_t *t;
     if (sim_cv_ntxt == SIM_TXT_MAX)
         return;
     t = &sim_cv_txt[sim_cv_ntxt++];
     t->x0 = x0; t->y0 = y0; t->x1 = x1; t->y1 = y1;
+    t->cut = (flags & 3u) != 0;          /* ellipsised or cut by its canvas */
     snprintf(t->s, sizeof t->s, "%s", s);
 }
-#define GFX_HOOK_TEXT(x0, y0, x1, y1, s, flags) sim__cv_text(x0, y0, x1, y1, s)
+#define GFX_HOOK_TEXT(x0, y0, x1, y1, s, flags) sim__cv_text(x0, y0, x1, y1, s, flags)
 #define GFX_HOOK_BLIT(x, y, r0) (sim_blit_x = (int32_t)(x), sim_blit_y = (int32_t)(y), sim_blit_r0 = (int32_t)(r0))
 #define GFX_HOOK_BEGIN() (sim_cv_ntxt = 0)
 #define GFX_HOOK_PIXELS(n) ((void)0)
@@ -361,6 +367,64 @@ static int sim_screen_text(const char *s)
             sim_txt[i].y1 <= 240)
             return 1;
     return 0;
+}
+static int sim__shown(const sim_txt_t *t)  /* wholly on the screen */
+{
+    return t->x0 >= 0 && t->x1 <= 240 && t->y0 >= 0 && t->y1 <= 240;
+}
+static int sim_screen_box(const char *s, int32_t box[4])   /* the ink box x0 y0 x1 y1 (past it) of text s */
+{
+    uint32_t i;
+    for (i = 0; i < sim_ntxt; i++)
+        if (!strcmp(sim_txt[i].s, s) && sim__shown(&sim_txt[i])) {
+            box[0] = sim_txt[i].x0; box[1] = sim_txt[i].y0; box[2] = sim_txt[i].x1; box[3] = sim_txt[i].y1;
+            return 1;
+        }
+    return 0;
+}
+static int sim_screen_line(const char *first, char *out, uint32_t n)
+{
+    int32_t b[4], used[SIM_TXT_MAX] = {0};
+    uint32_t i, k = 0;
+    out[0] = 0;
+    if (!sim_screen_box(first, b))
+        return 0;
+    for (;;) {                               /* the texts centred within first's rows, left to right */
+        int32_t best = -1;
+        for (i = 0; i < sim_ntxt; i++) {
+            const sim_txt_t *t = &sim_txt[i];
+            int32_t cy = (t->y0 + t->y1) / 2;
+            if (!used[i] && sim__shown(t) && cy >= b[1] && cy < b[3] && t->x0 >= b[0] &&
+                (best < 0 || t->x0 < sim_txt[best].x0))
+                best = (int32_t)i;
+        }
+        if (best < 0)
+            return 1;
+        used[best] = 1;
+        k += (uint32_t)snprintf(out + k, k < n ? n - k : 0, k ? " %s" : "%s", sim_txt[best].s);
+        if (k >= n)
+            return 1;
+    }
+}
+static int sim_screen_tidy(char *why, uint32_t n)
+{
+    uint32_t i, j;
+    for (i = 0; i < sim_ntxt; i++) {
+        const sim_txt_t *a = &sim_txt[i];
+        if (a->cut || !sim__shown(a)) {
+            snprintf(why, n, "\"%s\" cut (%d,%d .. %d,%d)", a->s, a->x0, a->y0, a->x1, a->y1);
+            return 0;
+        }
+        for (j = i + 1u; j < sim_ntxt; j++) {
+            const sim_txt_t *b = &sim_txt[j];
+            if (a->x0 < b->x1 && b->x0 < a->x1 && a->y0 < b->y1 && b->y0 < a->y1) {
+                snprintf(why, n, "\"%s\" and \"%s\" overlap", a->s, b->s);
+                return 0;
+            }
+        }
+    }
+    snprintf(why, n, "%u texts", sim_ntxt);
+    return 1;
 }
 static uint32_t sim_pad_led(uint32_t p) { return p < 16u ? sim_pad_sent[p] : 0u; }
 static int sim_button_led(uint32_t b) { return b < SMK_NLED && fm1_led[b]; }

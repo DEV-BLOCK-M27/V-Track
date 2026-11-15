@@ -4,8 +4,9 @@
  *   player_init()                    power-on: every track silent
  *   player_note_on(track, note)      a live note (MIDI number) on track 0..3: it takes the track's channel over
  *   player_note_off(track, note)     its release: silent, if it is the note the track plays
- *   player_play() / player_stop()    the sequencer: looped playback of the pattern (project.c) from its first
- *                                    row / silence; it takes effect at the next audio block
+ *   player_play() / player_stop()    the sequencer: looped playback of the patterns (project.c) from their first
+ *                                    row / silence; it takes effect at the next audio block. The loop is as long
+ *                                    as the longest of the four; a shorter one is silent (empty rows) past its end
  *   player_playing(), player_row()   whether it plays, and the row playing
  *   player_audio(out, n)             in the audio ISR: n stereo frames, Q15, interleaved L R
  *   player_track_name(track)         the chip and channel track 0..3 plays, as the screen names it ("NES · PULSE 1")
@@ -96,12 +97,25 @@ static void player_note_off(uint32_t track, uint32_t note)
         player.live[track] = 0;
 }
 
-static __attribute__((noinline)) void player_row_start(uint32_t row)   /* the audio ISR, once a row: its notes */
+static uint32_t player_rows(void)        /* the loop: as long as the longest of the tracks' patterns */
+{
+    uint32_t t, n = 0;
+    for (t = 0; t < PLAYER_TRACKS; t++) {
+        uint32_t r = project_rows(t);
+        n = r > n ? r : n;
+    }
+    return n;
+}
+
+/* the audio ISR, once a row: its notes; past the loop's end, row 0 */
+static __attribute__((noinline)) void player_row_start(uint32_t row)
 {
     uint32_t t, v;
+    if (row >= player_rows())
+        row = 0;
     player.row = (uint8_t)row;
     for (t = 0; t < PLAYER_TRACKS; t++) {
-        v = project_note(t, row);
+        v = project_field(t, row, PROJECT_F_NOTE);
         if (PROJECT_IS_NOTE(v))
             player.seq[t] = v << 16 | player_period(t, v - 1u);
         else if (v == PROJECT_CUT || v == PROJECT_RELEASE)
@@ -148,9 +162,8 @@ static void player_audio(int32_t *out, uint32_t n)
             out[2u * i] = out[2u * i + 1u] = player.mono[i];
         /* the row's time is up: the next row from the next block on */
         if (player.playing && (player.acc += k * project_bpm()) >= PLAYER_ROW_UNITS) {
-            uint32_t rows = project_rows(0);   /* (one length for all four tracks so far) */
             player.acc -= PLAYER_ROW_UNITS;
-            player_row_start(player.row + 1u < rows ? player.row + 1u : 0u);
+            player_row_start(player.row + 1u);
         }
     }
 }

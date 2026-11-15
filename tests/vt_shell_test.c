@@ -89,13 +89,13 @@ int main(int argc, char **argv)
     {   /* inputs not used yet: buttons, encoders, faders, wheels; USB MIDI notes, more than the device's ring holds */
         uint32_t i, refused = 0;
         sim_button(SMK_BTN_SEQ, 1);
-        sim_encoder(4, 3);
+        sim_encoder(0, 3);
         sim_fader(0, 100);
         sim_wheel(0, 900);
         sim_wheel(1, 200);
         sim_run_ms(50);
         sim_button(SMK_BTN_SEQ, 0);
-        sim_encoder(4, -3);
+        sim_encoder(0, -3);
         for (i = 0; i < 1000u; i++) {
             refused += !sim_midi_in(0x90, (uint8_t)(48u + i % 24u), 100);
             refused += !sim_midi_in(0x80, (uint8_t)(48u + i % 24u), 0);
