@@ -6,11 +6,13 @@
 #
 # DEVICE (seam A, tests/vt_sim.h): the firmware (firmware/src/vtrack.c) on a simulated SMK-37: input events and
 #                   elapsed time in; audio, the screen, the pad and button LEDs, MIDI out and the flash store out.
-#                   tests/vt_shell_test.c: the app shell (starts into the V-Track screen, silent, LEDs dark, no
-#                   flash written); the screen in build/host/shell.ppm. tests/vt_note_test.c: a key plays track 1,
+#                   tests/vt_shell_test.c: the app shell (starts into the pattern view, silent, button LEDs dark,
+#                   no flash written); the screen in build/host/shell.ppm. tests/vt_note_test.c: a key plays track 1,
 #                   NES Pulse 1, at the 2A03's pitch, one note at a time; a held C4 in build/host/note.wav.
 #                   tests/vt_tracks_test.c: K3 selects tracks 1 to 4 (NES Pulse 1, Pulse 2, Triangle, Noise), the
 #                   screen names each, the keys play each; track 3's screen in build/host/tracks.ppm.
+#                   tests/vt_pattern_test.c: step entry with REC (notes, cut, release), looped playback on all four
+#                   tracks at K4's tempo, the pads as rows and cursor; the screen in build/host/pattern.ppm.
 # NES chip core (seam B, tests/nes_test.c): register states in, samples out: duty waveforms, period -> frequency,
 #                   the triangle's staircase, the noise's periods and LFSR modes, the 2A03 mixer, no aliasing on
 #                   high notes.
@@ -102,7 +104,7 @@ run "update loader, SMK-37 Pro: app area 0x4000-0x9CFFF, protected ranges untouc
 # seam A: the device on the simulated SMK-37
 VT="-Ibuild/gen -Ifirmware/src -Ifirmware/hal -Itests"
 $CC $VT -o "$OUT/vt_shell_test" tests/vt_shell_test.c
-run "DEVICE: the app shell boots into the V-Track screen; silence, dark LEDs, no flash written" \
+run "DEVICE: the app shell boots into the pattern view; silence, dark button LEDs, no flash written" \
     "$OUT/vt_shell_test" "$OUT"
 $CC $VT -o "$OUT/vt_note_test" tests/vt_note_test.c -lm
 run "DEVICE: a key plays track 1 (NES Pulse 1) at the 2A03's pitch while held, one note at a time" \
@@ -110,6 +112,9 @@ run "DEVICE: a key plays track 1 (NES Pulse 1) at the 2A03's pitch while held, o
 $CC $VT -o "$OUT/vt_tracks_test" tests/vt_tracks_test.c -lm
 run "DEVICE: K3 selects tracks 1 to 4 (NES Pulse 1, Pulse 2, Triangle, Noise), named on screen, each played live" \
     "$OUT/vt_tracks_test" "$OUT"
+$CC $VT -o "$OUT/vt_pattern_test" tests/vt_pattern_test.c -lm
+run "DEVICE: a pattern step-entered (notes, cut, release) and played looped on four tracks at K4's tempo" \
+    "$OUT/vt_pattern_test" "$OUT"
 
 # seam B: the NES chip core alone
 $CC -o "$OUT/nes_test" tests/nes_test.c -lm
@@ -158,6 +163,8 @@ else
     run "ASan/UBSan: DEVICE, a note on track 1" "$A/vt_note_test"
     $SCC $VT -o "$A/vt_tracks_test" tests/vt_tracks_test.c -lm
     run "ASan/UBSan: DEVICE, the four tracks" "$A/vt_tracks_test"
+    $SCC $VT -o "$A/vt_pattern_test" tests/vt_pattern_test.c -lm
+    run "ASan/UBSan: DEVICE, a pattern entered and played" "$A/vt_pattern_test"
     $SCC -o "$A/nes_test" tests/nes_test.c -lm
     run "ASan/UBSan: NES chip core" "$A/nes_test"
 fi
