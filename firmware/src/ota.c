@@ -14,7 +14,7 @@
  * whose flash.bin is not exactly this board's size (OTA_FL_LEN: another
  * board's package) is refused in step 1, before anything is erased.
  *
- * Portable core: the firmware (felucca.c) and the Mac test (ota_test.c)
+ * Portable core: the firmware (vtrack.c) and the Mac test (ota_test.c)
  * supply these hooks:
  *   ota_wire_send(p, n)        one complete F0..F7 message to the host
  *   ota_frame_get(&p, &n)      next received SysEx (7-bit bytes between F0/F7), 0 if none

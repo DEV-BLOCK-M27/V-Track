@@ -33,7 +33,7 @@
 static uint32_t fm1_p33_timeouts;
 
 /* ------------------------------------------------------- second core --- */
-/* FM1_CPU1_USED (src/felucca.c: FELUCCA_CPU2, built in by default since 1.6.1; fm1_cpu1.h): the second core may be running. Every
+/* FM1_CPU1_USED (src/vtrack.c: FELUCCA_CPU2, off by default; fm1_cpu1.h): the second core may be running. Every
  * reset below holds it first: its waiting loop sits in RAM that the ROM, the SPL and the update loader use at boot, and
  * a core left running there would execute whatever they put in it. Hold: C1_CON bit 1 set, then bit 3 (enable)
  * cleared; registers only, safe when it never ran. Without FM1_CPU1_USED none of this is built.

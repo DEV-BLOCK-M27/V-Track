@@ -1,39 +1,25 @@
-# Building Felucca
+# Building V-Track
 
-The build makes three files in `build/`:
+V-Track builds for the SMK-37 (Pro, Elite, MKE-P37) only. The build makes three files in `build/`:
 
 | File | What |
 | --- | --- |
 | `felucca.bin` | the firmware app |
 | `loader/ota.bin` | the update loader |
-| `felucca.fwsc` | the installable package (app + loader) |
+| `felucca-smk37.fwsc` | the installable package (app + loader) |
 
-## Get the source
+## Prerequisites
 
-Five engines are in a git submodule (`firmware/engines/`, [Felucca-Engines](https://github.com/hugelton/Felucca-Engines),
-MIT), so clone with `--recurse-submodules`:
-
-```
-git clone --recurse-submodules https://github.com/hugelton/Felucca.git
-```
-
-In a clone made without it, run `git submodule update --init` once. GitHub's "Download ZIP" and the source archives
-it adds to a release leave `firmware/engines/` empty; each release also has `felucca-X.Y.Z-source.tar.gz`, the whole
-source with the submodule's files in it. The build stops with "firmware/engines is empty" when they are missing.
-
-## Prerequisites (macOS)
-
-- Python 3 with Pillow and fontTools: `pip3 install Pillow fonttools` (the UI font and icons are
-  rasterised at build time)
-- Docker Desktop. The JieLi toolchain is Linux x86-64 only; the build runs each tool in a
-  `linux/amd64` `debian:bookworm-slim` container (Rosetta on Apple silicon). Keep the source
-  tree in a folder Docker can share, e.g. under `/Users`.
-- The JieLi Linux toolchain (clang 4.0.1 for pi32v2, from JieLi's package server):
+- Python 3 with Pillow and fontTools: `pip3 install Pillow fonttools` (the UI font is rasterised at build time).
+  `PYTHON=/path/to/python3 ./build.sh` picks another interpreter (a virtualenv).
+- The JieLi Linux toolchain (clang 4.0.1 for pi32v2, from JieLi's package server), Linux x86-64 only:
 
   ```
   tools/get_toolchain.sh            # installs to ~/.jieli/toolchain
   ```
 
+  On macOS (or with `JIELI_DOCKER=1`) the build runs each tool in a `linux/amd64` `debian:bookworm-slim` container
+  (Docker Desktop; Rosetta on Apple silicon; keep the source tree in a folder Docker can share).
 - The JieLi AC79 SDK (Apache-2.0). The package uses three of its files
   (`cpu/wl82/tools/uboot.boot`, `cfg_tool.bin`, `cfg/eq_cfg_hw.bin`); they are not part of this tree.
 
@@ -43,9 +29,6 @@ source with the submodule's files in it. The build stops with "firmware/engines 
   ```
 
 - Node.js (optional, for the web tests).
-- Emscripten (optional, `emcc`: the browser emulator, `web/emu/`).
-
-On Linux x86-64 the toolchain runs natively and Docker is not needed.
 
 ## Build
 
@@ -56,62 +39,33 @@ On Linux x86-64 the toolchain runs natively and Docker is not needed.
 `JIELI_TOOLCHAIN` and `AC79_SDK` override the default locations
 (`~/.jieli/toolchain`, `~/fw-AC79_AIoT_SDK`).
 
-`./build.sh --release 1.0` makes a release build: the package identity becomes `FM-1_910`
-and the version string `v1.0`; the package is `build/felucca-1.0.fwsc`, and
-`build/release-1.0/` holds what a release ships: the package, the app
-(`felucca-1.0-app.bin`), `SHA256SUMS`, the sample attribution, `LICENSE`, `LICENSING.md` and
-`LICENSES/` (the package contains Apache-2.0 SDK files, so the licence texts travel with it).
+`MODEL=elite` or `MODEL=mke` builds the same firmware under the SMK-37 Elite's or the MKE-P37's model name
+(`build/felucca-smk37-elite.fwsc`, `build/felucca-smk37-mke.fwsc`), so the stock updater still takes that unit's factory
+package. `./build.sh --release 1.0` makes a release build: identity `SMK-37 Pro_910`, version string `v1.0`, the
+package `build/felucca-smk37-1.0.fwsc` and `build/release-1.0/` (the package, the app, `SHA256SUMS`, `LICENSE`,
+`LICENSING.md`, `LICENSES/`). The intermediate files (`build/felucca.bin`, `build/loader/ota.bin`, `build/felucca.dis`)
+are shared: build the Pro again before `tests/run_tests.sh`.
 
-Build options (environment, `0` or `1`; defaults in `firmware/src/felucca.c`, `core.h` and `icons.c`):
+Build options (environment, `0` or `1`; defaults in `firmware/src/vtrack.c`):
 
 | Flag | Default | |
 | --- | --- | --- |
-| `FELUCCA_FLASH` | 1 | settings, presets and projects in flash |
+| `FELUCCA_FLASH` | 1 | the flash driver and storage |
 | `FELUCCA_OTA` | 1 | update entry (needs `FELUCCA_FLASH`) |
-| `FELUCCA_CDC` | 1 | USB serial console |
-| `FELUCCA_CDC_DEFAULT` | 1 | `0`: the console is built in but left out of USB from boot (as MENU > USB SERIAL OFF) |
-| `FELUCCA_UAC` | 1 | USB audio input (the master output, stereo, 44.1 or 48 kHz) |
-| `FELUCCA_UAC_48K` | 1 | `0`: the USB audio input at 44.1 kHz only, as up to 1.0.5.2 (`firmware/src/usb.c`) |
-| `FELUCCA_UAC_AS_FIRST` | 1 | the audio control header lists the audio streaming interface before the MIDI one, so the USB audio driver of older macOS (up to 15) finds it; `0`: 1.0 to 1.5's order, byte for byte (`firmware/src/usb.c`) |
-| `FELUCCA_CPU2` | 1 | the second core is built in (MENU > SYSTEM > 2ND CORE, OFF by default); `0`: none of it, 1.6's one-core code and RAM (`firmware/hal/fm1_cpu1.h`, `firmware/src/fx.c`) |
-| `FELUCCA_UART` | 1 (SMK-37 Pro: 0) | TRS MIDI IN; must stay 0 on the SMK-37 Pro (PH8 is a key row there) |
-| `FELUCCA_SLICE` | 1 | the SLICE engine |
-| `FELUCCA_ICONS` | 1 | parameter icons on the knob cards |
-| `FELUCCA_FM4` | 0 | the retired DIGITAL engine (4-operator FM) instead of its FM6 conversion |
+| `FELUCCA_CDC` | 0 | USB serial (the device has no console behind it) |
+| `FELUCCA_UAC` | 1 | USB audio input (the output, stereo, 44.1 or 48 kHz) |
+| `FELUCCA_UAC_48K` | 1 | `0`: the USB audio input at 44.1 kHz only (`firmware/src/usb.c`) |
+| `FELUCCA_UAC_AS_FIRST` | 1 | the audio control header lists the audio streaming interface before the MIDI one (older macOS) |
+| `FELUCCA_CPU2` | 0 | `1`: the second core's code is linked in (nothing hands it work) |
 
 `FELUCCA_USB_LAYOUT` (`0` to `3`, default `0`) picks other USB descriptor layouts for testing; see
 `firmware/src/usb.c`.
 
-Target board: `BOARD=smk37 ./build.sh` (or `./build.sh --board smk37`) builds Felucca for the
-SMK-37 (beta): `-DBOARD_SMK37=1` for the app and the update loader, identity `SMK-37 Pro_900` (release
-`SMK-37 Pro_9XY`), the SMK flash layout (PRCT 0x9D000, the stock region table with USRTRIM / USRFLASH) and the
-package `build/felucca-smk37.fwsc`. `MODEL=elite` or `MODEL=mke` builds the same firmware under the SMK-37 Elite's or
-the MKE-P37's model name (`build/felucca-smk37-elite.fwsc`, `build/felucca-smk37-mke.fwsc`), so the stock updater still
-takes that unit's factory package. Controls: [SMK37.md](SMK37.md). The
-intermediate files (`build/felucca.bin`, `build/loader/ota.bin`, `build/felucca.dis`) are shared: build the FM-1
-again before `tests/run_tests.sh`. The default stays the FM-1, byte for byte.
+## The source
 
-## Samples
-
-The CC0 instrument samples that the SAMPLE engine uses are in `assets/samples-cc0/`
-(Versilian Studios, see `ATTRIBUTION.txt` there). `tools/fetch_cc0.py` downloads them
-again from the source repositories. Without that folder the build still works, with no
-instrument sets in the SAMPLE engine and no PIANO in SLICE (the PIANO set's middle C): they play a plain sine
-at the note's pitch instead, and the screen says NO SAMPLE.
-
-## Browser emulator
-
-```
-./build.sh
-web/emu/build.sh
-python3 -m http.server -d build/emu 8790     # open http://localhost:8790/
-```
-
-`web/emu/felucca_web.c` builds the firmware's sources as the host tests do, against a simulated FM-1, and
-Emscripten compiles it to WebAssembly (`build/emu/felucca.wasm`, with `index.html`, `worklet.js` and the font in `fonts/`). The page
-keeps the flash's storage sectors (projects, user presets, settings) in the browser. Not emulated: USB (audio,
-MIDI out, the editor, updates), TRS MIDI and the user sample slots. A build of it is on the site:
-<https://hugelton.github.io/Felucca/webapp/try/>.
+`firmware/src/vtrack.c` is the one compilation unit: the hardware layer (`firmware/hal/`, header-only), the display
+code, USB, the audio ISR, storage, the update entry, then the app (`firmware/src/app.c`) and the main loop
+(`firmware/src/main.c`). The update loader is `firmware/loader/`.
 
 ## Tests
 
@@ -119,23 +73,18 @@ MIDI out, the editor, updates), TRS MIDI and the user sample slots. A build of i
 tests/run_tests.sh
 ```
 
-Runs the host tests and, with Node.js, the web page tests (and, with Emscripten too, the browser emulator's). Run it after `./build.sh`
-(it uses `build/` and needs `AC79_SDK` set as for the build). The suites cover flash storage,
-user presets, projects of every format, backup, the keys and knobs, MIDI (USB, TRS, clock,
-control), USB audio, the update entry and loader, the command-line installer, the UI (the real
-drawing code against stubs: every screen in every palette is rendered and checked for clipped or
-overlapping text; PNGs land in `build/ui_new/`), every engine (DRUM, NOISE, PHYS, FM6, SLICE, the
-DIGITAL conversion), the chord keys, the modulation matrix, the FX layer, the reverbs, the SLICER
-and swing. With `DAISYSP` pointing at a DaisySP checkout, the PHYS models are also compared with
-their floating-point originals; without it that test is skipped. Felucca-Engines' own test
-(`firmware/engines/tests/run.sh`) runs too, and its standalone host is built once more with Felucca's tables
-against the same golden renders.
+Runs the host tests. Run it after `./build.sh` (it uses `build/` and needs
+`AC79_SDK` set as for the build).
 
-The regression suite (`tests/regress.c`) renders every engine and preset and compares a
-hash of each render with `tests/golden.txt`; it also checks levels, voices and the CPU
-cost (`tests/cpu_baseline.txt`, `tests/target_budget.txt`). After an intended change of
-the sound, `GOLDEN_UPDATE=1 sh tests/run_tests.sh` rewrites the hashes; `BUDGET_UPDATE=1`
-does the same for the cost files.
+The device tests run the firmware's own sources on a simulated SMK-37 (`tests/vt_sim.h`, seam A): a test sends input
+events (keys with velocity, pads, encoders, faders, buttons, wheels, USB MIDI) and lets time pass, then reads back what
+a player would see, hear and keep: the rendered audio, the 240 x 240 screen and the text on it, the pad and button LEDs,
+MIDI out and the flash store. The other suites cover flash storage, the SMK flash map and its allow-list, the store
+owner tag, USB descriptors and USB audio, the update entry and loader, the package layout, the command-line installer
+and the display code. `tests/target_budget.py` checks the loop cost of the ISRs in the target disassembly against
+`tests/target_budget.txt`; `BUDGET_UPDATE=1` rewrites it after an intended change.
+
+The browser emulator (`web/emu/`) still builds Felucca's sources; its V-Track port is a later step.
 
 ## Install
 
@@ -145,8 +94,8 @@ Use the web installer in Chrome or Edge:
 From the command line (needs `pip3 install mido python-rtmidi`):
 
 ```
-python3 tools/fm1_install.py build/felucca.fwsc
-python3 tools/fm1_install.py --info          # identity of the connected FM-1
+python3 tools/fm1_install.py build/felucca-smk37.fwsc
+python3 tools/fm1_install.py --info          # identity of the connected keyboard
 ```
 
 Or, to install your own build from the web installer, make a local copy of the site and open it from `localhost`

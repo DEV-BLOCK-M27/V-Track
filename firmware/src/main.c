@@ -1,23 +1,21 @@
 /* SPDX-License-Identifier: GPL-3.0-only
- * Copyright (C) 2026 Leo Kuroshita (@kurogedelic), Hügelton Instruments */
-/* FELUCCA boot and main loop. Boot order: WDT first, boot-loop guard, fatal vectors,
- * guards; then LCD, input (TIMER5 IRQ, 10 kHz), audio (ALNK0 IRQ). */
+ * Copyright (C) 2026 Leo Kuroshita (@kurogedelic), Hügelton Instruments
+ * V-Track: Copyright (C) 2026 Manuel Rubin */
+/* Boot and main loop. Boot order: WDT first, boot-loop guard, fatal vectors, guards (fm1_cstart); then the flash,
+ * the LCD and the boot screen, input (TIMER5 IRQ, 10 kHz), audio (ALNK0 IRQ), USB. The main loop:
+ *   vt_boot()             power-on up to the app's first screen
+ *   vt_frame()            one main-loop frame (~60 a second): USB requests, the update path, the app's frame
+ *   vt_idle()             between frames
+ * The host simulator (tests/vt_sim.h) drives these three as the device's fm1_main does. */
 extern uint32_t _data_start[], _data_end[], _data_load[], _bss_start[], _bss_end[];
 extern uint32_t _pool_start[], _pool_end[], _rt_start[], _rt_end[], _rt_load[];
-#if FELUCCA_CPU2
-extern uint32_t _c1_start[], _c1_end[], _c1_load[];
-#endif
 
-
-/* TIMER5 outranks ALNK0, so the scan keeps its 100 us pace while a half buffer renders: before,
- * the ticks stopped for the whole render (0.7 ms idle, several ms loaded), the column lit when it
- * began stayed lit that long (a ~16 Hz flicker over all LEDs, beating with the scan) and the
- * encoders lost frames. Nested in ALNK0 it only scans (GPIO + fm1_in, nothing the audio ISR touches)
- * and counts ms; USB and UART polls wait for the first tick after the render, as they always did,
- * and the time spent nested is handed to the audio ISR so its load figures stay render-only.
- * The USB audio stream cannot wait for the render (one packet per 1 ms frame, a render takes up to
- * ~5 ms): uac_service also runs nested. It touches only EP4 (INDEX is set on every access) and the
- * consumer side of the audio ring, and usb_poll never runs nested, so the two never interleave. */
+#ifndef VT_SIM                                  /* (the simulator has no interrupts, faults or reset) */
+/* TIMER5 outranks ALNK0, so the scan keeps its 100 us pace while a half buffer renders. Nested in ALNK0 it only scans
+ * (GPIO + fm1_in, nothing the audio ISR touches) and counts ms; the USB poll waits for the first tick after the
+ * render, and the time spent nested is handed to the audio ISR so its load figures stay render-only. The USB audio
+ * stream cannot wait for the render (one packet per 1 ms frame): uac_service also runs nested. It touches only EP4
+ * and the consumer side of the audio ring, and usb_poll never runs nested, so the two never interleave. */
 void fm1_timer5_irq(void)
 {
     static uint32_t sub, owed;
@@ -36,10 +34,6 @@ void fm1_timer5_irq(void)
     }
     if (usb_due)
         owed |= 1u;                             /* 2 kHz: all USB SIE traffic lives here */
-#if FELUCCA_UART
-    if (sub % 5u == 2u)
-        owed |= 2u;                             /* 2 kHz: <= ~7 bytes per call at 31250 baud */
-#endif
     if (++sub == 10u)
         sub = 0;
     if (felucca_dbg.in_audio) {
@@ -53,12 +47,9 @@ void fm1_timer5_irq(void)
     }
     if (owed & 1u)
         usb_poll();
-#if FELUCCA_UART
-    if (owed & 2u)
-        uart_midi_poll();
-#endif
     owed = 0;
 }
+#endif
 extern void isr_timer5(void);
 
 static void timer5_start(void)                 /* OSC /4 = 6 MHz, PRD 600 -> 10 kHz */
@@ -74,97 +65,14 @@ static void hexs(char *b, uint32_t v)
     b[8] = 0;
 }
 
-#if BOARD_SMK37
-/* pads as a step grid (1-8 top row): the DRUM grid, NAME, the layers' tiles (not SCL: notes) */
-static void smk_grid(void)
-{
-    uint32_t l = ui.layer ? ui.layer : ui.ly;
-    smk_pad_grid = (uint8_t)(grid_on() || (name_on() && !ui.menu) || (l && l != LAYER_SCL));
-}
-
-/* the SMK-37 Pro's 4 faders, tracks 1..4, by FADER BANK (ui_input.c smk_fbank), as the MIXER page: A LEVEL,
- * B PAN (the middle centre), C REV send, D DLY send. A fader takes over only once it moves (also after a bank
- * change), so nothing jumps. */
-static void smk_faders(void)
-{
-    static uint8_t last[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-    uint32_t i;
-    if (smk_fbank_new) {                                  /* a new bank: wait for each fader to move */
-        smk_fbank_new = 0;
-        for (i = 0; i < 4u; i++)
-            last[i] = 0xFF;
-    }
-    for (i = 0; i < 4u && i < NTRK; i++) {
-        uint32_t v = fm1_in.fader[i];
-        int16_t *pv;
-        if (last[i] == 0xFF || fm1_in.frames < 200u) {   /* (the first readings settle) */
-            last[i] = (uint8_t)v;
-            continue;
-        }
-        if (v == last[i])
-            continue;
-        last[i] = (uint8_t)v;
-        pv = smk_fbank == 1 ? &trk[i].p[P_PAN] : smk_fbank == 2 ? &trk[i].p[P_REV] :
-             smk_fbank == 3 ? &trk[i].p[P_DLY] : &trk[i].p[P_LEVEL];
-        *pv = (int16_t)(smk_fbank == 1 ? (int32_t)v - 64 : (int32_t)v);   /* (PAN -64..63) */
-        ui.force = 1;
-    }
-}
-
-/* the wheels (stock: mux C address 4 = pitch, 5 = mod), self-calibrating: the pitch wheel's rest is its centre
- * (taken at power-on, followed slowly while it rests), each wheel's range grows to what it has reached (the
- * travel is short: raw ~445..640 pitch, ~474..629 mod on a unit). Pitch: a 14-bit bend -8192..8191 with a dead
- * band around the centre; mod: 0..127, up (lower raw) = more. The audio ISR plays them as the selected track's
- * MIDI pitch bend and CC1 (seq.c smk_wheels_block) */
-static void smk_wheels(void)
-{
-    enum { DEAD = 12, SPAN0 = 80, MOD_LO = 485, MOD_HI = 615 };
-    static int32_t pc, plo, phi, mlo, mhi, rest;
-    int32_t p = fm1_in.wheel[0], m = fm1_in.wheel[1], d, b, mw;
-    if (fm1_in.frames < 300u)                     /* (the readings settle) */
-        return;
-    if (!pc) {
-        pc = p;
-        plo = p - SPAN0;
-        phi = p + SPAN0;
-        mlo = m < MOD_LO ? m : MOD_LO;
-        mhi = m > MOD_HI ? m : MOD_HI;
-    }
-    if (p < plo)
-        plo = p;
-    if (p > phi)
-        phi = p;
-    if (m < mlo)
-        mlo = m;
-    if (m > mhi)
-        mhi = m;
-    d = p - pc;
-    if (d > -DEAD && d < DEAD) {
-        b = 0;
-        if (++rest > 200) {                        /* resting: the centre follows a slow drift */
-            pc += d > 0 ? 1 : d < 0 ? -1 : 0;
-            rest = 0;
-        }
-    } else {
-        rest = 0;
-        b = d > 0 ? (d - DEAD) * 8191 / (phi - pc - DEAD > 1 ? phi - pc - DEAD : 1)
-                  : (d + DEAD) * 8192 / (pc - plo - DEAD > 1 ? pc - plo - DEAD : 1);
-        b = clamp(b, -8192, 8191);
-    }
-    mw = mhi - m <= DEAD ? 0 : (mhi - m - DEAD) * 127 / (mhi - mlo - DEAD > 1 ? mhi - mlo - DEAD : 1);
-    smk_bend14 = (int16_t)b;
-    smk_modw = (uint8_t)clamp(mw, 0, 127);
-}
-#endif
-
+#ifndef VT_SIM
 static void fm1_fault(const fm1_crash_t *c)
 {
     char b[12];
     uint32_t t0;
     fm1_audio_stop();
-    scr_wake_now();                                   /* (MENU > SCREEN OFF: the panel on first) */
     lcd_fill(0, 0, 240, 240, UI_CRASH_BG);            /* fixed, outside the palettes */
-    draw_text_line(0, 8, 240, &AF_M, "FELUCCA CRASH", UI_CRASH_INK, UI_CRASH_BG, 1);
+    draw_text_line(0, 8, 240, &AF_M, "V-TRACK CRASH", UI_CRASH_INK, UI_CRASH_BG, 1);
     hexs(b, c->vec);
     draw_text_line(10, 40, 220, &AF_M, b, UI_CRASH_INK, UI_CRASH_BG, 0);
     hexs(b, c->pc);
@@ -180,242 +88,108 @@ static void fm1_fault(const fm1_crash_t *c)
         ;
     fm1_reboot();
 }
+#endif
 
-/* power-on: the parts with their default sounds (TRK_DEF); the sequencers empty */
-static void felucca_init(void)
+static void enter_uboot(const char *why)       /* mask-ROM UBOOT with RAM intact (debug / stock updater) */
 {
-    uint32_t i;
-    chain_defaults(&chain_config);
-    for (i = 0; i < G_COUNT; i++)
-        song.g[i] = GP[i].def;
-    undo_depth++;                             /* (no undo copy of the power-on loads) */
-    fm6_init();                               /* every track's FM6 patch: the init voice */
-    for (i = 0; i < NTRK; i++) {
-        track_t *t = &trk[i];
-        track_defaults(t);
-        set_engine_of(t, TRK_DEF[i][0]);
-        apply_preset_to(t, TRK_DEF[i][1]);    /* with its sends */
-        t->engine = t->eng_req;
-        eng_mem_claim(t);                     /* (zeros already: no note can come before) */
-        track_defaults_steps(t);              /* (a sound load never touches them) */
-        if (TRK_DEF[i][2])
-            load_pat16(t, PATTERNS[TRK_DEF[i][2] - 1u].note, PATTERNS[TRK_DEF[i][2] - 1u].flags);
-        pat_sig[i] = steps_sig(t);            /* a default pattern, not the user's */
-        pat_last[i] = TRK_DEF[i][2];
-    }
-    undo_depth--;
-    song.sel = 0;
-    song.master_q12 = 2048;                   /* (the pot's level replaces it before the audio starts: master_boot) */
-    ui.home = 1;
-    ui.force = 1;
+    fm1_audio_stop();
+    lcd_fill(0, 0, 240, 240, T_BG);
+    draw_text_box(0, 110, 240, &AF_M, why, T_THEME, 1);
+    fm1_delay_ms(20);
+    usb_detach();
+    fm1_delay_ms(30);
+    bootguard.pending = 0;                      /* intentional reset: not a failed boot */
+    fm1_enter_uboot();
 }
 
-/* The power-on LED sweep (1.1, hal/fm1_led_anim.h: a soft light over the keys left to right, then the buttons swell
- * and settle on the glow; ~0.70 s), started before the scan and run by it: nothing waits for it, the splash's 430 ms
- * and the first ~0.27 s of the UI go by under it (the UI's LEDs from its end, or at once on a key or a button down).
- * Every LEDS setting: it is no idle glow; with DIM HI / DIM LO it ends on that glow (and is drawn over that glow
- * level), with OFF / INV dark. Not with MENU > ANIM OFF (no motion: the LEDs as the UI has them at once), not after a crash (a crash record newer than the last boot saw: the crash screen's
- * reset), a hang (a WDT reset) or a failed boot (bootguard: the last one died within its first 30 s): straight to the
- * UI. The UBOOT paths never get here. */
-static uint32_t crash_seen __attribute__((section(".noinit")));   /* fm1_crash.count at the last boot */
-static uint8_t boot_clean;                    /* no crash, hang (WDT) or failed boot before this one (boot_leds):
-                                               * the sweep runs and the autosave is restored (project.c autosave_boot) */
-static void boot_leds(void)
+#if FELUCCA_FLASH
+static void flash_boot(void)                    /* flash_ok (storage_hw.c): the expected part answered */
 {
-    uint32_t crashed = fm1_crash.magic == FM1_CRASH_MAGIC && fm1_crash.count != crash_seen
-#if FELUCCA_CPU2
-                       && fm1_crash.core != 1u    /* (the second core's own fault left core 0 playing) */
-#endif
-                       ;
-    crash_seen = fm1_crash.count;
-    boot_clean = !crashed && !bootguard.failed && !(fm1_boot.p3_rst & 4u);
-    fm1_led_dim_level(settings_leds == LEDS_DIM_LO);
-    if (boot_clean && !(ui_prefs & PREF_ANIM_OFF))
-        fm1_led_anim_start(settings_leds == LEDS_DIM || settings_leds == LEDS_DIM_LO);
-}
-
-static void fm1_main(void)
-{
-    uint32_t ms;
-#if FELUCCA_CPU2
-    uint8_t c1_told = 0;                                /* 2ND CORE MISREAD shown (and ON cleared) */
-#endif
-    persist_boot();
+    uint32_t f = irq_save();
+    flash_ok = FL_JEDEC_OK(FL_FAR(fl_jedec_ram)());
+    irq_restore(f);
+    if (!flash_ok)
+        return;
+    fl_plain_window_init();                     /* flash above 0x9D000 reads as plaintext through XIP */
+    smk_trim_load(fm1_xip_ptr(SMK_TRIM_FLASH));   /* the factory key / pad velocity curves (USRTRIM, read only) */
 #if FELUCCA_OTA
-    if (flash_ok)
-        ota_boot_cleanup();                             /* staging area left by an update */
+    ota_boot_cleanup();                         /* staging area left by an update */
 #endif
-    settings_init();
-    usb_serial_apply();                                 /* (#67: the saved USB SERIAL before usb_start) */
-    lcd_init();
-    draw_splash();                                      /* ui_draw.c (1.1.5) */
+}
+#endif
+
+static void vt_boot(void)
+{
     if (felucca_dbg.magic != DBG_MAGIC) {
         memset(&felucca_dbg, 0, sizeof felucca_dbg);
         felucca_dbg.magic = DBG_MAGIC;
     }
     felucca_dbg.boots++;
     felucca_dbg.max_us = 0;
-    felucca_dbg.in_audio = 0;                       /* .noinit: a reset inside the audio ISR left it set, and
-                                                       TIMER5 would treat every tick as nested (no USB poll) */
-    felucca_dbg.prev_stage = felucca_dbg.stage;     /* a WDT reset leaves the last breadcrumb here */
-    felucca_dbg.prev_page = felucca_dbg.page;
-    felucca_dbg.prev_home = felucca_dbg.home;
-    felucca_dbg.prev_frames = felucca_dbg.ui_frames;
-    felucca_dbg.prev_rst = fm1_boot.p3_rst;
-    fm1_input_init();
-    fm1_adc_init();
-#if BOARD_SMK37 && FELUCCA_FLASH
-    if (flash_ok)                                   /* the factory key / pad velocity curves (USRTRIM, read only) */
-        smk_trim_load(fm1_xip_ptr(SMK_TRIM_FLASH));
+    felucca_dbg.in_audio = 0;                   /* .noinit: a reset inside the audio ISR left it set, and TIMER5
+                                                   would treat every tick as nested (no USB poll) */
+    fm1_input_init();                           /* (the default velocity curves; flash_boot reads the unit's) */
+#if FELUCCA_FLASH
+    flash_boot();
 #endif
-    panel_init();
-    felucca_init();
-    master_boot();
-    kb_boot_hold = 1;                         /* #137: no notes from the keys before the UI (seq.c keyboard_block) */
-#if FELUCCA_CPU2
-    if (!bootguard.failed && (ui_prefs2 & (PREF_CPU2_ON >> 16))) {
-        /* the second core (hal/fm1_cpu1.h; fx.c mix_block hands it parts), at power-on, before the audio and
-         * the timers (started later it never reaches its entry). It starts in the chip's ROM: the PC limits open
-         * meanwhile. MENU > 2ND CORE OFF (the default), a crash in the last boot's first 30 s, or no answer: it is
-         * never started, one core, as 1.6 */
-        fm1_guard_pc_open();
-        fm1_cpu1_start();
-        fm1_guard_enable(FM1_GUARD_PC);
-    }
-#endif
+    lcd_init();
+    app_boot_screen();
     audio_init();
     usb_start();
-#if FELUCCA_UART
-    uart_midi_init();
-#endif
-    boot_leds();
     timer5_start();
     fm1_guard_lock_top();
     fm1_irq_enable_all();
-    fm1_delay_ms(30);
-    if ((fm1_in.buttons & FM1_OCT_BOTH) == FM1_OCT_BOTH) {
-        panel_setup();                        /* OCT- + OCT+ held at power-on */
-        settings_save();
-    }
-    autosave_boot(boot_clean);                /* (1.2) the last session's music, under the splash */
-    for (ms = 0; ms < 400u; ms += 10u) {      /* the splash; the pot followed (MIDI IN plays under it) */
-        fm1_delay_ms(10);
-        master_poll();
-    }
-    kb_boot_hold = 0;
-    lcd_fill(0, 0, 240, 240, T_BG);
-    scrn.idle = fm1_ms;                        /* (MENU > SCREEN OFF: from here) */
+    fm1_delay_ms(430);                          /* the boot screen */
+    app_start();
+}
 
+static void vt_frame(void)
+{
+    static uint32_t uboot_t0;
+    fm1_wdt_feed();
+    usb_retry(fm1_ms);
+    if (fm1_ms > 30000u && bootguard.pending) {     /* a crash or hang in the first 30 s counts */
+        bootguard.pending = 0;
+        bootguard.failed = 0;
+    }
+    if ((fm1_in.buttons & FM1_OCT_BOTH) != FM1_OCT_BOTH)            /* OCTAVE- + OCTAVE+ held 5 s: UBOOT */
+        uboot_t0 = fm1_ms;
+    else if (fm1_ms - uboot_t0 > 5000u)
+        enter_uboot("UBOOT");
+#if FELUCCA_OTA
+    ota_service();                                  /* M-UPGRADE handshake */
+    if (usb.ota_req) {                              /* M-UPGRADE upgrade command */
+        usb.ota_req = 0;
+        if (flash_ok)
+            ota_session();                          /* returns only if nothing was committed */
+        lcd_fill(0, 0, 240, 240, T_BG);
+        app_start();                                /* (the app draws its screen again) */
+    }
+#endif
+    if (usb.uboot_req)                              /* SysEx F0 22 24 35 7D F7 from the host */
+        enter_uboot("UBOOT (USB)");
+    felucca_dbg.ui_frames++;
+    app_frame();
+    padled_flush();                                 /* the pads' colours, between LCD transfers */
+}
+
+static void vt_idle(void)
+{
+    app_idle();
+#if FELUCCA_OTA
+    ota_service();                                  /* replies without waiting for the next frame */
+#endif
+}
+
+#ifndef VT_SIM
+static void fm1_main(void)
+{
+    vt_boot();
     for (;;) {
         uint32_t m = fm1_ms;
-        fm1_wdt_feed();
-        usb_retry(fm1_ms);
-        if (fm1_ms > 30000u && bootguard.pending) {     /* a crash or hang in the first 30 s counts */
-            bootguard.pending = 0;
-            bootguard.failed = 0;
-        }
-#if FELUCCA_CPU2
-        if (*(volatile uint8_t *)&fm1_c1_gave_up && !c1_told) {   /* (the ISR's) */
-            c1_told = 1;                                /* (once: ON set again afterwards stays, for the next power-on) */
-            if (ui_prefs2 & (PREF_CPU2_ON >> 16)) {
-                ui_prefs2 &= (uint8_t)~(PREF_CPU2_ON >> 16);   /* core 1 misread or stopped answering on this FM-1: one
-                                                         * core from now on (MENU > 2ND CORE ON tries again) */
-                settings_later();
-            }
-            ui_message("2ND CORE MISREAD: OFF");     /* (ui.msg: 23 characters at most) */
-        }
-#endif
-        {
-            int32_t b = fm1_adc_read(FM1_ADC_BATT);     /* battery: slow IIR */
-            if (b > 0)
-                song.batt_raw = song.batt_raw ? song.batt_raw + (b - song.batt_raw) / 32 : b;
-        }
-        master_poll();
-        {   /* OCT- + OCT+ held 5 s: enter UBOOT with RAM intact (debug / update); a countdown
-             * shows from 2 s over the whole screen (the menu and the dialogs too: ui_draw), letting
-             * go cancels it */
-            static uint32_t t0;
-            uint32_t both = (1u << panel.btn[B_OCTDN]) | (1u << panel.btn[B_OCTUP]);
-            if ((fm1_in.buttons & both) != both) {
-                if (ui.uboot) {
-                    ui.uboot = 0;
-                    ui.force = 1;                       /* what the countdown covered */
-                    ui_message("UPDATE CANCELLED");
-                }
-                t0 = fm1_ms;
-            } else if (fm1_ms - t0 > 2000u && fm1_ms - t0 <= 5000u) {
-                uint32_t left = (5000u - (fm1_ms - t0) + 999u) / 1000u;
-                if (left != ui.uboot) {
-                    ui.uboot = (uint8_t)left;
-                    ui.force = 1;
-                }
-            } else if (fm1_ms - t0 > 5000u) {
-                fm1_audio_stop();
-                scr_wake_now();
-                lcd_fill(0, 0, 240, 240, T_BG);
-                draw_text_box(0, 110, 240, &AF_M, "UBOOT", T_THEME, 1);
-                usb_detach();
-                fm1_delay_ms(30);
-                bootguard.pending = 0;                  /* intentional reset: not a failed boot */
-                fm1_enter_uboot();
-            }
-        }
-#if FELUCCA_OTA
-        ed_service();                                   /* web editor SysEx */
-        ota_service();                                  /* M-UPGRADE handshake */
-        if (usb.ota_req) {                              /* M-UPGRADE upgrade command */
-            usb.ota_req = 0;
-            panic_req = (1u << NTRK) - 1u;               /* every track (bit per track) */
-            scr_wake_now();                             /* (its progress on the screen) */
-            if (flash_ok)
-                ota_session();                          /* returns only if nothing was committed */
-            lcd_fill(0, 0, 240, 240, T_BG);
-            ui.force = 1;
-        }
-#endif
-        if (usb.uboot_req) {                            /* SysEx F0 22 24 35 7D F7 from the host */
-            fm1_audio_stop();
-            scr_wake_now();
-            lcd_fill(0, 0, 240, 240, T_BG);
-            draw_text_box(0, 110, 240, &AF_M, "UBOOT (USB)", T_THEME, 1);
-            fm1_delay_ms(20);
-            usb_detach();
-            fm1_delay_ms(30);
-            bootguard.pending = 0;
-            fm1_enter_uboot();
-        }
-#if FELUCCA_CDC
-        cdc_task();
-#endif
-        felucca_dbg.ui_frames++;
-        felucca_dbg.page = ui.page;
-        felucca_dbg.home = ui.home;
-        felucca_dbg.stage = 1;
-        ui_input();
-        settings_poll();                              /* queued settings save: only while stopped */
-        autosave_poll();                              /* (1.2) the music, stopped and idle: project.c */
-        felucca_dbg.stage = 2;
-#if BOARD_SMK37
-        smk_grid();
-#endif
-        ui_leds();
-#if BOARD_SMK37
-        smk_faders();
-        smk_wheels();
-        padled_flush();                                 /* the pads' colours, between LCD transfers */
-#endif
-        ui_draw();
-        felucca_dbg.stage = 9;
-        while (fm1_ms - m < 15u) {                               /* ~60 UI frames/s at most */
-            ui_input();
-#if BOARD_SMK37
-            smk_wheels();                       /* (bends follow the wheel, not the screen) */
-            smk_grid();
-#endif
-#if FELUCCA_OTA
-            ed_service();                       /* editor replies without waiting for the next frame */
-#endif
-        }
+        vt_frame();
+        while (fm1_ms - m < 15u)                    /* ~60 frames/s at most */
+            vt_idle();
     }
 }
 
@@ -423,9 +197,8 @@ void fm1_cstart(void)
 {
     uint32_t *s, *d, p3, src, wdt;
 #if FELUCCA_CPU2
-    fm1_cpu1_halt();                           /* (after Jangada, X0X): a second core still running from before
-                                                * this reset (a watchdog, a fault, another firmware) would read the RAM
-                                                * cleared below */
+    fm1_cpu1_halt();                           /* a second core still running from before this reset (a watchdog, a
+                                                * fault, another firmware) would read the RAM cleared below */
 #endif
     fm1_time_init();
     fm1_reset_reason();
@@ -455,10 +228,6 @@ void fm1_cstart(void)
         *d = *s;
     for (s = _rt_load, d = _rt_start; d < _rt_end; s++, d++)
         *d = *s;                                /* flash driver code that must run from RAM */
-#if FELUCCA_CPU2
-    for (s = _c1_load, d = _c1_start; d < _c1_end; s++, d++)
-        *d = *s;                                /* the second core's waiting loop (hal/fm1_cpu1.h) */
-#endif
     fm1_mailbox_clear();
     fm1_guard_enable(FM1_GUARD_STACK | FM1_GUARD_WRITE | FM1_GUARD_BUS | FM1_GUARD_PC);
     fm1_boot.p3_rst = (uint8_t)p3;
@@ -468,3 +237,4 @@ void fm1_cstart(void)
     for (;;)
         ;
 }
+#endif

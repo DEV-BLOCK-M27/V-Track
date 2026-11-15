@@ -1,5 +1,8 @@
 # Felucca on the SMK-37 (beta)
 
+> V-Track: this page describes Felucca's SMK-37 port, the base V-Track is built on (docs/adr/0001). The build and
+> install sections apply to V-Track; its controls are its own (the control mapping in the V-Track spec, #1).
+
 Felucca also builds for the SMK-37, a 37-key controller with the same chip as the FM-1. The FM-1 build
 is unchanged; everything for the SMK-37 is behind `BOARD_SMK37`.
 
@@ -46,10 +49,10 @@ The SMK-37's TRS jack is a MIDI output and this build does not use it; there is 
 See [BUILDING.md](BUILDING.md) for the toolchain.
 
 ```sh
-BOARD=smk37 ./build.sh                 # build/felucca-smk37.fwsc (SMK-37 Pro)
-BOARD=smk37 MODEL=elite ./build.sh     # build/felucca-smk37-elite.fwsc
-BOARD=smk37 MODEL=mke ./build.sh       # build/felucca-smk37-mke.fwsc
-./build.sh                             # the FM-1 build again before tests/run_tests.sh (the tests use its files)
+./build.sh                             # build/felucca-smk37.fwsc (SMK-37 Pro)
+MODEL=elite ./build.sh                 # build/felucca-smk37-elite.fwsc
+MODEL=mke ./build.sh                   # build/felucca-smk37-mke.fwsc
+./build.sh                             # the Pro build again before tests/run_tests.sh (the tests use its files)
 ```
 
 ## Install

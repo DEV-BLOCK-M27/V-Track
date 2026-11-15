@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (C) 2026 Leo Kuroshita (@kurogedelic), Hügelton Instruments
-"""Build Felucca: the app, the update loader and an installable .fwsc package.
+"""Build V-Track: the app, the update loader and an installable .fwsc package for the SMK-37.
 
-  tools/build.py [--release X.Y[-suffix]] [--board fm1|smk37] [--model pro|elite|mke]
+  tools/build.py [--release X.Y[-suffix]] [--model pro|elite|mke]
 
-Outputs in build/: felucca.bin (app), loader/ota.bin (update loader),
-felucca.fwsc (package). A release build (--release X.Y) writes felucca-X.Y.fwsc and a folder
-release-X.Y/ with the package, the app, SHA256SUMS, the sample attribution and the licence files.
-See BUILDING.md for the toolchain and the SDK.
+Outputs in build/: felucca.bin (app), loader/ota.bin (update loader), felucca-smk37.fwsc (package). A release build
+(--release X.Y) writes felucca-smk37-X.Y.fwsc and a folder release-X.Y/ with the package, the app, SHA256SUMS and the
+licence files. See BUILDING.md for the toolchain and the SDK.
 
-BOARD=smk37 (or --board smk37) builds Felucca for the SMK-37 Pro: -DBOARD_SMK37=1 for the app and
-the loader, identity SMK-37 Pro_900 (release SMK-37 Pro_9XY), the SMK flash layout (fm1pkg_make.py), and the
-package build/felucca-smk37.fwsc (felucca-smk37-X.Y.fwsc for a release). The default stays the FM-1.
-MODEL=elite / mke (or --model) with smk37: the same build under the SMK-37 Elite's or the MKE-P37's model
-name (identity SMK-37 Elite_900 / MKE-P37_900, the loader's and the update record's name too; -DSMK_MODEL),
-so the stock updater still takes that unit's factory package; build/felucca-smk37-elite.fwsc, -mke.fwsc.
+The SMK-37 is the only target (docs/adr/0001): -DBOARD_SMK37=1 for the app and the loader, identity SMK-37 Pro_900
+(release SMK-37 Pro_9XY), the SMK flash layout (fm1pkg_make.py). MODEL=elite / mke (or --model): the same build under
+the SMK-37 Elite's or the MKE-P37's model name (identity SMK-37 Elite_900 / MKE-P37_900, the loader's and the update
+record's name too; -DSMK_MODEL), so the stock updater still takes that unit's factory package;
+build/felucca-smk37-elite.fwsc, -mke.fwsc. (--board smk37 / BOARD=smk37 are accepted; no other board is.)
 
 The JieLi toolchain is Linux x86-64 only. JIELI_TOOLCHAIN points at it; on
 macOS (or with JIELI_DOCKER=1) each tool runs in a linux/amd64 container.
@@ -56,18 +54,18 @@ SDK_SHA256 = {
     "cfg/eq_cfg_hw.bin": "41167491bffed4651750719c973d2758adeb9021a5670d02d6a53c85ed80ea7d",
 }
 
-PRODUCT = "FM-1_900"                # package identity; release builds are FM-1_9XY
-BOARD = "fm1"                       # fm1 (default) or smk37: BOARD env or --board
-BOARD_PREFIX = {"fm1": "FM-1_9", "smk37": "SMK-37 Pro_9"}   # identity of a release build: prefix + X + Y
-BOARD_DEFS = {"fm1": [], "smk37": ["-DBOARD_SMK37=1"]}       # the FM-1 build gets no new flag (byte-identical)
-BOARD_STEM = {"fm1": "felucca", "smk37": "felucca-smk37"}        # package name: STEM.fwsc, STEM-X.Y.fwsc
+PRODUCT = "SMK-37 Pro_900"          # package identity; release builds are SMK-37 Pro_9XY
+BOARD = "smk37"                     # the only board
+BOARD_PREFIX = {"smk37": "SMK-37 Pro_9"}       # identity of a release build: prefix + X + Y
+BOARD_DEFS = {"smk37": ["-DBOARD_SMK37=1"]}
+BOARD_STEM = {"smk37": "felucca-smk37"}        # package name: STEM.fwsc, STEM-X.Y.fwsc
 # smk37: the keyboard's model name (MODEL env or --model); one hardware, three names. pro adds no flag
 MODELS = {"pro": "SMK-37 Pro", "elite": "SMK-37 Elite", "mke": "MKE-P37"}
-VERSION = None                      # FELUCCA_VERSION for release builds (default: firmware/src/felucca.c)
-# FELUCCA_CPU2 (firmware/src/felucca.c), unset or 1, the default (1.6.1): the second core is built in, its entry and
-# stacks (firmware/hal/fm1_cpu1.S) linked and its waiting loop (.c1_text) checked; MENU > SYSTEM > 2ND CORE starts it
-# (OFF by default: one core, as 1.6). FELUCCA_CPU2=0: none of it is built (1.6's one-core code and RAM)
-CPU2 = os.environ.get("FELUCCA_CPU2") != "0"
+VERSION = None                      # FELUCCA_VERSION for release builds (default: firmware/src/vtrack.c)
+# FELUCCA_CPU2 (firmware/src/vtrack.c): unset or 0, the default: one core, none of the second core's code is built.
+# FELUCCA_CPU2=1 links its entry and stacks (firmware/hal/fm1_cpu1.S) and checks its waiting loop (.c1_text); nothing
+# in V-Track hands it work yet
+CPU2 = os.environ.get("FELUCCA_CPU2") == "1"
 
 
 def toolchain():
@@ -108,18 +106,15 @@ def tc_all(*cmds):
 
 
 def generate():
-    """generated headers (UI fonts, icons, keycaps, palettes, tables, samples)"""
+    """generated headers (the UI font, keycaps, palettes: firmware/src/gfx.c)"""
     GEN.mkdir(parents=True, exist_ok=True)
-    for old in ("felucca_font.h", "felucca_icons.h"):     # headers of the bitmap font and icon atlas
+    for old in ("felucca_font.h", "felucca_icons.h", "ui_icons.h", "felucca_tables.h", "felucca_fm6.h",
+                "felucca_samples.h"):     # Felucca's (its engines, icons, samples): not part of V-Track
         (GEN / old).unlink(missing_ok=True)
     tools = SRC / "tools"
     cmds = [[tools / "gen_aa_font.py", GEN / "ui_fonts.h", "--preset", "inter-tight"],
-            [tools / "gen_aa_icons.py", GEN / "ui_icons.h"],
             [tools / "gen_aa_keycaps.py", GEN / "ui_keycaps.h"],
-            [tools / "gen_ui_palettes.py", GEN / "ui_palettes.h"],
-            [tools / "gen_tables.py", GEN / "felucca_tables.h"],
-            [tools / "gen_fm6_patches.py", GEN / "felucca_fm6.h"],
-            [tools / "gen_samples.py", GEN / "felucca_samples.h"]]
+            [tools / "gen_ui_palettes.py", GEN / "ui_palettes.h"]]
     procs = [subprocess.Popen([sys.executable, *map(str, c)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               text=True) for c in cmds]
     failed = []
@@ -206,9 +201,9 @@ def ld_regions():
 def build_app():
     flags = [*CFLAGS, *BOARD_DEFS[BOARD], "-Ifirmware/hal", "-Ifirmware/src", "-Ibuild/gen"]
     for flag in ("FELUCCA_FLASH", "FELUCCA_OTA", "FELUCCA_OTA_DRYRUN", "FELUCCA_OTA_RAMONLY", "FELUCCA_CDC",
-                 "FELUCCA_UART", "FELUCCA_UAC", "FELUCCA_UAC_TONE", "FELUCCA_UAC_48K", "FELUCCA_ICONS", "FELUCCA_SLICE", "FELUCCA_FM4",
-                 "FELUCCA_CDC_DEFAULT", "FELUCCA_UAC_AS_FIRST", "FELUCCA_CPU2"):
-        v = os.environ.get(flag)    # unset: the default in firmware/src/felucca.c
+                 "FELUCCA_UAC", "FELUCCA_UAC_TONE", "FELUCCA_UAC_48K", "FELUCCA_CDC_DEFAULT", "FELUCCA_UAC_AS_FIRST",
+                 "FELUCCA_CPU2"):
+        v = os.environ.get(flag)    # unset: the default in firmware/src/vtrack.c
         if v in ("0", "1"):
             flags.append(f"-D{flag}={v}")
     v = os.environ.get("FELUCCA_USB_LAYOUT")   # firmware/src/usb.c: how the USB composite presents itself (#67), 0..3
@@ -217,12 +212,12 @@ def build_app():
     flags.append(f'-DFELUCCA_ID="{PRODUCT}"')
     if VERSION:
         flags.append(f'-DFELUCCA_VERSION="{VERSION}"')
-    # felucca.c goes to LLVM IR without the optimizer, the main-loop functions (UI, stores, editor) are
+    # vtrack.c goes to LLVM IR without the optimizer, the main-loop functions (the app, stores, USB) are
     # marked minsize (tools/size_fns.py), then the IR is compiled at -Os. FELUCCA_SIZE=0: -Os everywhere
     size = os.environ.get("FELUCCA_SIZE") != "0"
     cmain = (("cc", *flags, "-S", "-emit-llvm", "-Xclang", "-disable-llvm-optzns", "-c",
-              FW / "src" / "felucca.c", "-o", OUT / "felucca.ll") if size else
-             ("cc", *flags, "-c", FW / "src" / "felucca.c", "-o", OUT / "felucca.o"))
+              FW / "src" / "vtrack.c", "-o", OUT / "felucca.ll") if size else
+             ("cc", *flags, "-c", FW / "src" / "vtrack.c", "-o", OUT / "felucca.o"))
     (OUT / "fm1_cpu1.o").unlink(missing_ok=True)
     tc_all(("cc", "-c", FW / "crt0.S", "-o", OUT / "crt0.o"),
            ("cc", "-c", FW / "hal" / "fm1_vec.S", "-o", OUT / "fm1_vec.o"),
@@ -346,7 +341,7 @@ def check(img, syms, dis, rt):
     return errors, notes
 
 
-# Every hardware register access lives in hal/. In src/, engines/src/ and loader/ (comments stripped):
+# Every hardware register access lives in hal/. In src/ and loader/ (comments stripped):
 #  - no volatile pointer cast, except of a C object's address (`*(volatile T *)&x`: a read-once
 #    of a RAM flag shared with an ISR, e.g. usb.c ota_wire_send);
 #  - no literal in a register or reserved window (core SFRs 0x10000-0x13FFF, SFC 0x40000-0x43FFF,
@@ -376,8 +371,7 @@ def mmio_check():
             break
         regs |= more
     errors = []
-    for f in sorted([*(FW / "src").glob("*.[ch]"), *(FW / "engines" / "src").glob("*.[ch]"),
-                     *(FW / "loader").glob("*.c")]):
+    for f in sorted([*(FW / "src").glob("*.[ch]"), *(FW / "loader").glob("*.c")]):
         for no, ln in enumerate(strip(f.read_text()).splitlines(), 1):
             where = f"{f.relative_to(FW)}:{no}"
             for rx, what in ((MMIO_LIT, "register/window address"), (MMIO_CAST, "volatile pointer cast"),
@@ -394,16 +388,16 @@ def mmio_check():
 def main():
     global PRODUCT, VERSION, BOARD, APP_SLOT
     ap = argparse.ArgumentParser()
-    ap.add_argument("--release", metavar="X.Y", help="release build: identity FM-1_9XY, version string vX.Y")
+    ap.add_argument("--release", metavar="X.Y", help="release build: identity SMK-37 Pro_9XY, version string vX.Y")
     ap.add_argument("--board", choices=sorted(BOARD_PREFIX), default=None,
-                    help="target board: fm1 (default) or smk37 (default: $BOARD, else fm1)")
+                    help="target board: smk37 (the only one)")
     ap.add_argument("--model", choices=sorted(MODELS), default=None,
                     help="smk37: the model name, pro (default), elite or mke (default: $MODEL, else pro)")
     ap.add_argument("--sdk", type=Path, help="JieLi AC79 SDK checkout (default: $AC79_SDK)")
     a = ap.parse_args()
-    BOARD = (a.board or os.environ.get("BOARD") or "fm1").lower().replace("-", "")
+    BOARD = (a.board or os.environ.get("BOARD") or "smk37").lower().replace("-", "")
     if BOARD not in BOARD_PREFIX:
-        raise SystemExit(f"BOARD={BOARD}: use fm1 or smk37")
+        raise SystemExit(f"BOARD={BOARD}: V-Track builds for the SMK-37 only (smk37)")
     model = (a.model or (os.environ.get("MODEL") if BOARD == "smk37" else None) or "pro").lower()
     if model not in MODELS or (model != "pro" and BOARD != "smk37"):
         raise SystemExit(f"MODEL={model}: pro, elite or mke, with BOARD=smk37")
@@ -424,9 +418,6 @@ def main():
         PRODUCT = BOARD_PREFIX[BOARD] + m[1] + m[2]
         VERSION = "v" + a.release.lower()      # e.g. v1.0, v1.1-rc1
         name = f"{stem}-{a.release}.fwsc"
-    if not (FW / "engines" / "src" / "felucca_engine.h").exists():
-        raise SystemExit("firmware/engines is empty: the Felucca-Engines submodule "
-                         "(git submodule update --init, or clone with --recurse-submodules)")
     fm1pkg_make.SDK = a.sdk
     for rel, sha in SDK_SHA256.items():          # fail early without the SDK
         if hashlib.sha256(fm1pkg_make.sdk_file(rel)).hexdigest() != sha:
@@ -441,7 +432,7 @@ def main():
     hal_err = mmio_check()
     errors += hal_err
     if not hal_err:
-        notes.append("register access: hal/ only (src/, engines/src/, loader/ clean)")
+        notes.append("register access: hal/ only (src/, loader/ clean)")
     for n in notes:
         print("  ok   ", n)
     for e in errors:
@@ -450,9 +441,6 @@ def main():
         raise SystemExit("build: checks failed")
     pkg = fm1pkg_make.ufw(fm1pkg_make.flash_image(img, fm1pkg_make.KEY), ota, PRODUCT)
     (OUT / name).write_bytes(pkg)
-    att = SRC / "assets" / "samples-cc0" / "ATTRIBUTION.txt"
-    if att.exists():
-        shutil.copy(att, OUT / "ATTRIBUTION.txt")
     print(f"app      {OUT / 'felucca.bin'}  {len(img)} B")
     print(f"loader   {LDR / 'ota.bin'}  {len(ota)} B")
     print(f"package  {OUT / name}  {len(pkg)} B, identity {PRODUCT}, board {BOARD}")
@@ -467,12 +455,8 @@ def main():
                                                 for n, b in ((name, pkg), (app, bytes(img)))))
         for f in sorted((SRC / "LICENSES").glob("*.txt")):
             shutil.copy(f, rel / "LICENSES" / f.name)
-        if not (rel / "LICENSES" / "MIT-Felucca-Engines.txt").exists():     # ANALOG LOFI TRIO WHEEL NOISE (engines/)
-            raise SystemExit("release: LICENSES/MIT-Felucca-Engines.txt is missing")
         for doc in ("LICENSE", "LICENSING.md"):
             shutil.copy(SRC / doc, rel / doc)
-        if att.exists():
-            shutil.copy(att, rel / "ATTRIBUTION.txt")
         print(f"release  {rel}/")
     return 0
 

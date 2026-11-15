@@ -795,7 +795,7 @@ static void sysex_byte(uint8_t b)
         else if (sx_collect && sx_pos) {
             sx_frame_len = sx_pos;
             RING_PUBLISH();
-            sx_ready = 1;                               /* main loop: ota_take() / ed_service() */
+            sx_ready = 1;                               /* main loop: ota_take() */
         }
         sx_collect = 0;
 #endif
@@ -868,7 +868,7 @@ static void ep1_rx(void)                                /* leaves the packet (NA
 }
 
 #if FELUCCA_OTA
-/* ---- SysEx frames for the main loop (ota.c / editor.c hooks; felucca.c and the
+/* ---- SysEx frames for the main loop (ota.c hooks; vtrack.c (ota_hw.c) and the
  * update loader supply ota_now_ms / ota_idle) ---- */
 static uint32_t ota_now_ms(void);
 static void ota_idle(void);

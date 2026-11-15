@@ -4,9 +4,9 @@
 """Build the main-loop code for size (build.py): the functions defined in SIZE_FILES get LLVM's
 minsize (about -Oz) while everything else (the sound, render and ISR code, the flash and OTA code,
 the main loop) keeps -Os. The JieLi clang 4 has no '#pragma clang attribute' and its minsize
-attribute is an error on variables, so build.py compiles felucca.c to LLVM IR without the
+attribute is an error on variables, so build.py compiles vtrack.c to LLVM IR without the
 optimizer, this script adds 'minsize' to those definitions, and the IR is then compiled at -Os
-(without the edit, that round trip is byte-identical to compiling felucca.c directly).
+(without the edit, that round trip is byte-identical to compiling vtrack.c directly).
   size_fns.py IN.ll OUT.ll"""
 import re
 import sys
@@ -14,15 +14,9 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
 SRC = _ROOT / "firmware" / "src" if (_ROOT / "firmware" / "src").is_dir() else _ROOT / "src"   # either layout
-# the UI, the stores, the editor and the console: main loop only, never called by sound code; and (1.1) every
-# other file without DSP: USB, MIDI, the sequencer, the drawing, the LCD, OTA, ... Of those, what an interrupt
-# reaches (ISR_ROOTS and everything they call or name, from the IR) keeps -Os (isr_reach)
-SIZE_FILES = ["ui.c", "favorites.c", "menu_items.c", "icons.c", "ui_graph.c", "ui_draw.c", "ui_menu.c", "ui_input.c",
-              "storage.c", "upreset.c", "project.c", "settings_persist.c",
-              "editor.c", "editor_preferences.c", "editor_backup.c", "editor_menu.c", "console.c",
-              "usb.c", "midi_uart.c", "midi_control.c", "midi_clock.c", "seq.c", "song_chain.c", "chord.c", "motion.c",
-              "panel.c", "lcd.c", "gfx.c", "ota.c", "ota_hw.c", "up_fm6.c", "slice_store.c", "params.c", "editor_fm6.c",
-              "ui_layer.c", "ui_name.c", "ui_slice.c", "ui_events.c", "main.c", "libc.c", "storage_hw.c", "engines.c", "fm4_convert.c"]
+# the main loop's files: the app, the stores, USB, the drawing, the LCD, OTA. Of those, what an interrupt reaches
+# (ISR_ROOTS and everything they call or name, from the IR) keeps -Os (isr_reach)
+SIZE_FILES = ["app.c", "storage.c", "usb.c", "lcd.c", "gfx.c", "ota.c", "ota_hw.c", "main.c", "libc.c", "storage_hw.c"]
 ISR_ROOTS = ("fm1_alnk0_irq", "fm1_timer5_irq")      # hal/fm1_isr.S: the audio ISR, the key / LED scan (+ USB poll)
 DEF = re.compile(r"^(?:static|void|int|uint\w*|int\w*|const)\b[^;=(]*?\b([A-Za-z_]\w*)\s*\(", re.M)
 IR_DEF = re.compile(r"^(define [^\n]*?@\"?([\w.]+)\"?\([^\n]*\)(?: unnamed_addr| local_unnamed_addr)?)( #\d+[^\n]*\{)$",
