@@ -19,10 +19,19 @@
  *   project_bpm(), project_set_bpm(b)   the tempo, one row a sixteenth; kept within PROJECT_BPM_MIN .. MAX
  *   project_ins_chip(i)                 the chip instrument 0..15 belongs to (ADR 0002), PROJECT_CHIP_NONE: a free slot
  *   project_ins_name(i)                 its name ("" for a free slot)
- *   project_ins_new(i, chip, name)      slot i becomes an instrument of the chip, every sequence empty
+ *   project_set_ins_name(i, name)       renames it: up to 7 characters, trailing spaces dropped
+ *   project_ins_new(i, chip, name)      slot i becomes an instrument of the chip, every sequence empty (its steps 0)
+ *   project_ins_copy(from, to)          instrument from (not free) copied to slot to (free): the same chip, name and
+ *                                       sequences; 1 if done, else 0 (nothing changed)
  *   project_seq(i, s)                   its sequence s (PROJECT_SEQ_*), read-only: len steps (0 = none, 64 at most),
  *                                       v[0 .. len-1], loop and release a step or PROJECT_SEQ_NONE
  *   project_set_seq(i, s, v, n, loop, release)  sets it (n kept to 64; a loop or release past the end: none)
+ *   project_set_step(i, s, k, v)        step k (0..63) of it to v, kept within PROJECT_SEQ_MIN .. MAX[s]; a step
+ *                                       past its end lengthens it to k + 1 (the steps between keep what they hold)
+ *   project_set_len(i, s, n)            its length, kept within 0 .. 64 (steps past it keep what they hold; a loop
+ *                                       or release point past it: none)
+ *   project_set_loop(i, s, k), project_set_release(i, s, k)   its loop / release point: a step within its length
+ *                                       or PROJECT_SEQ_NONE (anything else is refused)
  * An NES instrument's sequences: volume 0..15, arpeggio (semitones added to the note), pitch (added to the period
  * each frame: + lower), duty 0..3 (a pulse) or mode 0..1 (the noise). A new project has the factory instruments 00
  * LEAD, 01 BASS, 02 KICK (the triangle), 03 SNARE and 04 HAT (the noise); 05 to 0F are free.
@@ -61,6 +70,13 @@
 #define PROJECT_SEQ_NONE 0xFFu           /* no loop / release point */
 #define PROJECT_NAME 8u                  /* an instrument's name: up to 7 characters */
 
+#define PROJECT_ORDER() __asm__ volatile("" ::: "memory")   /* the stores before it land before those after (the
+                                                            * player in the audio ISR relies on the order) */
+
+/* each sequence's values: volume 0..15, arpeggio -24..24 semitones, pitch -127..127, duty 0..3 (mode 0..1) */
+static const int8_t PROJECT_SEQ_MIN[PROJECT_SEQS] = {0, -24, -127, 0},
+                    PROJECT_SEQ_MAX[PROJECT_SEQS] = {15, 24, 127, 3};
+
 typedef struct {
     uint8_t len, loop, release;
     int8_t v[PROJECT_SEQ_STEPS];
@@ -92,6 +108,21 @@ static uint32_t project_ins_chip(uint32_t i)
 
 static const char *project_ins_name(uint32_t i) { return i < PROJECT_INSTRUMENTS ? project_pat.ins_def[i].name : ""; }
 
+static void project_set_ins_name(uint32_t i, const char *name)
+{
+    char *d;
+    uint32_t k;
+    if (i >= PROJECT_INSTRUMENTS)
+        return;
+    d = project_pat.ins_def[i].name;
+    for (k = 0; k + 1u < PROJECT_NAME && name[k]; k++)
+        d[k] = name[k];
+    for (; k < PROJECT_NAME; k++)
+        d[k] = 0;
+    for (k = PROJECT_NAME - 1u; k-- > 0 && d[k] == ' ';)
+        d[k] = 0;
+}
+
 static void project_ins_new(uint32_t i, uint32_t chip, const char *name)
 {
     project_ins_t *d;
@@ -100,12 +131,24 @@ static void project_ins_new(uint32_t i, uint32_t chip, const char *name)
         return;
     d = &project_pat.ins_def[i];
     d->chip = (uint8_t)chip;
-    for (k = 0; k + 1u < PROJECT_NAME && name[k]; k++)
-        d->name[k] = name[k];
-    for (; k < PROJECT_NAME; k++)
-        d->name[k] = 0;
-    for (s = 0; s < PROJECT_SEQS; s++)
+    project_set_ins_name(i, name);
+    for (s = 0; s < PROJECT_SEQS; s++) {
         d->seq[s].len = 0, d->seq[s].loop = d->seq[s].release = PROJECT_SEQ_NONE;
+        for (k = 0; k < PROJECT_SEQ_STEPS; k++)
+            d->seq[s].v[k] = 0;
+    }
+}
+
+static int project_ins_copy(uint32_t from, uint32_t to)
+{
+    if (from >= PROJECT_INSTRUMENTS || to >= PROJECT_INSTRUMENTS || project_ins_chip(from) == PROJECT_CHIP_NONE ||
+        project_ins_chip(to) != PROJECT_CHIP_NONE)
+        return 0;
+    memcpy(project_pat.ins_def[to].name, project_pat.ins_def[from].name, sizeof project_pat.ins_def[to].name);
+    memcpy(project_pat.ins_def[to].seq, project_pat.ins_def[from].seq, sizeof project_pat.ins_def[to].seq);
+    PROJECT_ORDER();
+    project_pat.ins_def[to].chip = project_pat.ins_def[from].chip;   /* last: the player plays it from now on */
+    return 1;
 }
 
 static const project_seq_t *project_seq(uint32_t i, uint32_t s)
@@ -128,6 +171,49 @@ static void project_set_seq(uint32_t i, uint32_t s, const int8_t *v, uint32_t n,
     q->release = (uint8_t)(release < n ? release : PROJECT_SEQ_NONE);
     q->len = (uint8_t)n;
 }
+
+static void project_set_step(uint32_t i, uint32_t s, uint32_t k, int32_t v)
+{
+    project_seq_t *q;
+    if (i >= PROJECT_INSTRUMENTS || s >= PROJECT_SEQS || k >= PROJECT_SEQ_STEPS)
+        return;
+    q = &project_pat.ins_def[i].seq[s];
+    q->v[k] = (int8_t)(v < PROJECT_SEQ_MIN[s] ? PROJECT_SEQ_MIN[s] : v > PROJECT_SEQ_MAX[s] ? PROJECT_SEQ_MAX[s] : v);
+    PROJECT_ORDER();
+    if (k >= q->len)                     /* (one byte: the player sees the old length or the new) */
+        q->len = (uint8_t)(k + 1u);
+}
+
+static void project_set_len(uint32_t i, uint32_t s, int32_t n)
+{
+    project_seq_t *q;
+    if (i >= PROJECT_INSTRUMENTS || s >= PROJECT_SEQS)
+        return;
+    q = &project_pat.ins_def[i].seq[s];
+    n = n < 0 ? 0 : n > (int32_t)PROJECT_SEQ_STEPS ? (int32_t)PROJECT_SEQ_STEPS : n;
+    if (q->loop != PROJECT_SEQ_NONE && q->loop >= n)   /* (the points first: the player never sees one past it) */
+        q->loop = PROJECT_SEQ_NONE;
+    if (q->release != PROJECT_SEQ_NONE && q->release >= n)
+        q->release = PROJECT_SEQ_NONE;
+    PROJECT_ORDER();
+    q->len = (uint8_t)n;
+}
+
+static void project_set_point(uint32_t i, uint32_t s, uint32_t k, uint32_t release)
+{
+    project_seq_t *q;
+    if (i >= PROJECT_INSTRUMENTS || s >= PROJECT_SEQS)
+        return;
+    q = &project_pat.ins_def[i].seq[s];
+    if (k != PROJECT_SEQ_NONE && k >= q->len)
+        return;
+    if (release)
+        q->release = (uint8_t)k;
+    else
+        q->loop = (uint8_t)k;
+}
+static void project_set_loop(uint32_t i, uint32_t s, uint32_t k) { project_set_point(i, s, k, 0); }
+static void project_set_release(uint32_t i, uint32_t s, uint32_t k) { project_set_point(i, s, k, 1); }
 
 /* the factory instruments: name; volume, arpeggio, pitch, duty sequences (n, loop, release, steps) */
 #define PROJECT_FACTORY 5u

@@ -10,9 +10,12 @@
 #include <math.h>
 #include "vt_sim.h"
 
-#define K2 1u                                /* encoders: K2 cursor, K3 track, K7 volume */
-#define K3 2u
+#define K2 1u                                /* encoders: K2 cursor, K3 track, K7 volume; in the editor (PATCH) */
+#define K3 2u                                /* K2 step, K3 sequence, K5 value, K6 length, K7 loop, K8 release */
+#define K5 4u
+#define K6 5u
 #define K7 6u
+#define K8 7u
 #define KEY_C4 12u                           /* keybed key 0 = C3 */
 #define KEY_C6 36u
 #define CPU_HZ 1789773.0
@@ -21,6 +24,8 @@
 #define HZ_G4 (CPU_HZ / (16.0 * (0x11C + 1)))
 #define FRAME (44100.0 / 60.0988)            /* a NES NTSC frame: 733.8 samples */
 #define NONE PROJECT_SEQ_NONE
+
+static const int32_t LEAST[4] = {0, -24, -127, 0};   /* each sequence's least value: volume, arpeggio, pitch, duty */
 
 static int fails;
 static void check(int ok, const char *what)
@@ -171,6 +176,35 @@ static void select_ins(uint32_t i)           /* instrument mode, pad i tapped, b
     button(SMK_BTN_NOTE_REPEAT);
 }
 
+/* the instrument editor (PATCH): free slot i becomes a copy of the selected instrument (shift + its pad), every
+ * sequence emptied, then its sequence s set to v[0..n-1], loop and release a step or NONE. Back to the pattern view,
+ * i selected */
+static void edit_ins(uint32_t i, uint32_t s, const int8_t *v, uint32_t n, uint32_t loop, uint32_t release)
+{
+    uint32_t k;
+    button(SMK_BTN_PATCH);
+    sim_button(SMK_BTN_KNOB_BANK, 1);
+    tap(i);
+    sim_button(SMK_BTN_KNOB_BANK, 0);
+    for (k = 0; k < 4u; k++) {               /* each sequence: length 0 */
+        turn(K3, k ? 1 : -4);
+        turn(K6, -64);
+    }
+    turn(K3, -4);
+    turn(K3, (int32_t)s);
+    turn(K2, -64);
+    for (k = 0; k < n; k++) {                /* each step: down to its least, up to v */
+        turn(K5, -255);
+        turn(K5, v[k] - LEAST[s]);
+        turn(K2, 1);
+    }
+    turn(K7, -64);                           /* none, then up to the step */
+    turn(K7, loop == NONE ? 0 : (int32_t)loop + 1);
+    turn(K8, -64);
+    turn(K8, release == NONE ? 0 : (int32_t)release + 1);
+    button(SMK_BTN_SEQ);
+}
+
 static int32_t *hold(uint32_t key, uint32_t ms, uint32_t *n)   /* key held for ms: the audio from the press on */
 {
     free(left(n));
@@ -241,7 +275,7 @@ int main(int argc, char **argv)
     free(left(&n));
 
     /* a decaying volume sequence (15 12 9 6 3 0) fades a step a frame (C6 on Pulse 1) */
-    sim_instrument(5, PROJECT_SEQ_VOL, FADE, 6, NONE, NONE);
+    edit_ins(5, PROJECT_SEQ_VOL, FADE, 6, NONE, NONE);
     select_ins(5);
     a = hold(KEY_C6, 300, &n);
     s0 = onset(a, n);
@@ -257,7 +291,7 @@ int main(int argc, char **argv)
     free(a);
 
     /* an arpeggio 0 4 7 looping at 0: C E G C E G, a frame each, on one channel */
-    sim_instrument(6, PROJECT_SEQ_ARP, ARP, 3, 0, NONE);
+    edit_ins(6, PROJECT_SEQ_ARP, ARP, 3, 0, NONE);
     select_ins(6);
     a = hold(KEY_C4, 200, &n);
     s0 = onset(a, n);
@@ -270,7 +304,7 @@ int main(int argc, char **argv)
     free(a);
 
     /* a duty sequence 0 1 2 3 looping: 12.5 25 50 75 % a frame each (C6 on Pulse 1) */
-    sim_instrument(7, PROJECT_SEQ_DUTY, DUTY, 4, 0, NONE);
+    edit_ins(7, PROJECT_SEQ_DUTY, DUTY, 4, 0, NONE);
     select_ins(7);
     a = hold(KEY_C6, 200, &n);
     s0 = onset(a, n);
@@ -284,9 +318,9 @@ int main(int argc, char **argv)
     /* row volume x sequence volume / 15, at least 1: on P01 of track 1, C6 rows with
      * row 00 FULL (15) at row volume 8, 01 HALF (8) at F, 02 ONE (1) at 1, 03 FULL at 1, 04 FULL at F (a row
      * volume holds until the next, so each row has its own) */
-    sim_instrument(8, PROJECT_SEQ_VOL, FULL, 1, NONE, NONE);
-    sim_instrument(9, PROJECT_SEQ_VOL, HALF, 1, NONE, NONE);
-    sim_instrument(10, PROJECT_SEQ_VOL, ONE, 1, NONE, NONE);
+    edit_ins(8, PROJECT_SEQ_VOL, FULL, 1, NONE, NONE);
+    edit_ins(9, PROJECT_SEQ_VOL, HALF, 1, NONE, NONE);
+    edit_ins(10, PROJECT_SEQ_VOL, ONE, 1, NONE, NONE);
     sim_button(SMK_BTN_KNOB_BANK, 1);
     button(SMK_BTN_RIGHT);
     sim_button(SMK_BTN_KNOB_BANK, 0);
@@ -326,7 +360,7 @@ int main(int argc, char **argv)
 
     /* release and cut: on P02, LOOPREL (15 9, looping at 0, released at 1; then 6 3 0):
      * row 00 C-6 LOOPREL, 02 ===, 04 C-6, 06 --- */
-    sim_instrument(11, PROJECT_SEQ_VOL, LOOPREL, 5, 0, 1);
+    edit_ins(11, PROJECT_SEQ_VOL, LOOPREL, 5, 0, 1);
     sim_button(SMK_BTN_KNOB_BANK, 1);
     button(SMK_BTN_RIGHT);
     sim_button(SMK_BTN_KNOB_BANK, 0);

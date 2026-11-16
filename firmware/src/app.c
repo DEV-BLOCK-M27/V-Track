@@ -7,7 +7,7 @@
  *   app_frame()         each main-loop frame (~60 a second): input in, LEDs and display out
  *   app_idle()          between frames, as often as the main loop gets round to it
  *   app_audio(out, n)   in the audio ISR: n stereo frames, Q15, interleaved L R
- * So far, one view, the pattern view (docs/design/pattern-view.png): a header (the track, its chip and channel, its
+ * Two views. The pattern view (docs/design/pattern-view.png): a header (the track, its chip and channel, its
  * pattern Pxx; the tempo, REC, the pattern's length) over 13 rows of the selected track's pattern, all four columns
  * (note, instrument, volume, effect), and the other three tracks' note columns right of a separator. The cursor row
  * has a blue bar, the playing row a red one (both: purple). The screen follows the cursor, scrolling as little as
@@ -30,7 +30,20 @@
  * other chips) dark, taking no tap. A tap selects the instrument: the header shows it (INSxx and its name), the keys
  * play it, step entry writes it into the instrument column with the note, and K6 on an empty instrument starts
  * from it. None is selected at first (the keys play a plain tone, step entry leaves the column empty); a track of
- * another chip drops it. Every other input (USB MIDI in too) is taken and dropped. */
+ * another chip drops it.
+ * PATCH opens the instrument editor on the selected instrument (none: the chip's first, which is selected), SEQ goes
+ * back to the pattern view; PATCH's LED is lit in the editor. A header (INSxx, its name with the name's cursor under
+ * a character, the chip; the track the keys play) over the four sequences' panels: VOL, ARP, PITCH, DUTY (MODE on
+ * the noise track), each its length, loop and release point over a bar graph of its 64 steps (the length's on a
+ * lighter ground; a green line before the loop point's step, an orange one before the release point's); the selected
+ * panel lighter, with the cursor's step brighter and its number and value at the left. K2 moves the cursor along the
+ * steps, K3 selects the sequence, K5 sets the step's value (within project.c's PROJECT_SEQ_MIN .. MAX, the mode
+ * 0..1 on the noise track; a step past the end lengthens the sequence to it, from what it holds), K6 the length (0 to 64), K7 the loop point and K8 the release point (none,
+ * then the steps within the length); K4 sets the name's character at the name's cursor (space, A to Z, 0 to 9, -),
+ * shift + K4 moves that cursor (7 characters). All of them stop at their ends. The pads are the instruments as in
+ * instrument mode; a tap edits that one, shift + a free slot's pad copies the edited instrument there and edits the
+ * copy. The keys play the edited instrument on the selected track (step entry is off), so a held note plays each
+ * edited step it reaches (one it has played to the end of no more: the player's rules, player.c). Every other input (USB MIDI in too) is taken and dropped. */
 #define VT_NAME "V-Track"
 #define VT_KEY_NOTE0 48u         /* keybed key 0 = C3 (MIDI 48) */
 #define VT_ENC_TRACK 2u          /* K3: track select */
@@ -72,6 +85,34 @@
 #define VT_LINE_PLAYING 2u
 #define VT_LINE_PAST 4u          /* past the pattern's end: blank */
 #define VT_NO_INS PLAYER_NO_INS  /* no instrument selected */
+#define VT_VIEW_PATTERN 0u       /* app.view */
+#define VT_VIEW_EDITOR 1u
+#define VT_ENC_STEP 1u           /* the editor: K2 step, K3 sequence, K4 name, K5 value, K6 length, K7 loop, */
+#define VT_ENC_SEQ 2u            /* K8 release */
+#define VT_ENC_NAME 3u
+#define VT_ENC_VALUE 4u
+#define VT_ENC_LEN 5u
+#define VT_ENC_LOOP 6u
+#define VT_ENC_RELEASE 7u
+#define VT_SEQ_H 52u             /* a sequence's panel: a label line over its bar graph */
+#define VT_SEQ_LABEL_H 14
+#define VT_GRAPH_X 46            /* the graph: a step every VT_STEP_W px, VT_GRAPH_H rows */
+#define VT_GRAPH_H 36
+#define VT_STEP_W 3
+#define VT_NAME_X 50             /* the editor's name, monospaced, a cell each character */
+#define VT_C_SEQ_SEL RGB(14, 14, 30)  /* the selected sequence's panel */
+#define VT_C_GRAPH RGB(36, 36, 56)    /* the graph within the length, past it */
+#define VT_C_GRAPH_PAST RGB(10, 10, 14)
+#define VT_C_BAR RGB(90, 190, 230)
+#define VT_C_BAR_STEP RGB(240, 240, 240)   /* the step the cursor is on */
+#define VT_C_STEP RGB(50, 60, 110)    /* .. its column */
+#define VT_C_LOOP RGB(90, 210, 90)
+#define VT_C_RELEASE RGB(230, 120, 60)
+
+typedef struct {                 /* what a sequence's panel shows: drawn again when it changes */
+    project_seq_t q;
+    uint8_t ins, sel, step, mode;
+} vt_panel_t;
 
 typedef struct {                 /* what a screen line shows: drawn again when it changes */
     uint8_t row, mark, note[PROJECT_TRACKS], ins, vol;
@@ -92,6 +133,9 @@ static struct {
     uint8_t key_track[FM1_NKEY]; /* the track each held key plays on */
     uint16_t pads_held;          /* the pads held at the last frame, a bit each */
     vt_line_t shown[VT_SHOWN];   /* what each screen line shows */
+    uint8_t view;                /* VT_VIEW_* */
+    uint8_t seq, step, name_pos; /* the editor: its sequence, step, the name's cursor */
+    vt_panel_t panel[PROJECT_SEQS];   /* what each sequence's panel shows */
 } app;
 
 static const uint8_t VT_PAD_EMPTY[3] = {2, 2, 6}, VT_PAD_NOTE[3] = {0, 20, 60}, VT_PAD_CURSOR[3] = {60, 60, 60},
@@ -117,6 +161,7 @@ static void app_redraw(void)         /* the header and every line again */
 {
     app.head = 0;
     memset(app.shown, 0xFF, sizeof app.shown);   /* (no line shows row 0xFF) */
+    memset(app.panel, 0xFF, sizeof app.panel);   /* (no panel shows instrument 0xFF) */
 }
 
 static void app_start(void)
@@ -136,6 +181,8 @@ static void app_start(void)
     app.last[PROJECT_F_VOL] = PROJECT_VOL(PROJECT_VOLUMES - 1u);
     app.pads_held = 0;
     app.keys = fm1_in.keys;              /* keys held already: no note until pressed again */
+    app.view = VT_VIEW_PATTERN;
+    app.seq = app.step = app.name_pos = 0;
     lcd_fill(0, 0, 240, 240, VT_C_BG);
 }
 
@@ -148,6 +195,11 @@ static uint32_t app_chip(uint32_t track)   /* the chip track 0..3 plays (ADR 000
 static int app_ins_offered(uint32_t i)   /* instrument i is one of the selected track's chip */
 {
     return project_ins_chip(i) == app_chip(app.track);
+}
+
+static uint32_t app_noise(void)      /* the noise track: the duty sequence is the noise's mode (0..1) */
+{
+    return app.track == PLAYER_NOISE;
 }
 
 static uint32_t app_page(void) { return app.cursor / VT_PAGE * VT_PAGE; }   /* the cursor page's first row */
@@ -246,7 +298,8 @@ static int app_black(uint32_t k)     /* keybed key k is a black key */
 static void app_keys(void)           /* the keybed: releases, then the highest key newly pressed */
 {
     uint64_t now = fm1_in.keys, down = now & ~app.keys, up = app.keys & ~now;
-    uint32_t k, shift = fm1_in.buttons >> SMK_BTN_KNOB_BANK & 1u, enter = app.rec && !player_playing();
+    uint32_t k, shift = fm1_in.buttons >> SMK_BTN_KNOB_BANK & 1u, enter = app.rec && !player_playing() &&
+                                                                          app.view == VT_VIEW_PATTERN;
     app.keys = now;
     for (k = 0; k < FM1_NKEY; k++)
         if (up >> k & 1u)
@@ -266,17 +319,92 @@ static void app_keys(void)           /* the keybed: releases, then the highest k
         }
 }
 
+/* --- the instrument editor (PATCH) --- */
+
+static void app_view(uint32_t v)     /* PATCH: the editor for the selected instrument (none: the chip's first); SEQ:
+                                      * the pattern view */
+{
+    uint32_t i;
+    if (v == VT_VIEW_EDITOR && app.ins == VT_NO_INS)
+        for (i = 0; i < PROJECT_INSTRUMENTS && app.ins == VT_NO_INS; i++)
+            if (app_ins_offered(i))
+                app.ins = (uint8_t)i;
+    if (v == VT_VIEW_EDITOR && app.ins == VT_NO_INS)
+        return;                          /* (no instrument of the chip at all) */
+    if (v == VT_VIEW_EDITOR)
+        app.last[PROJECT_F_INS] = (uint8_t)PROJECT_INS(app.ins);
+    if (v != app.view) {
+        app.view = (uint8_t)v;
+        app_redraw();
+        lcd_fill(0, 0, 240, 240, VT_C_BG);
+    }
+}
+
+static void app_editor_edit(uint32_t e, int32_t steps, uint32_t shift)   /* an encoder turned in the editor */
+{
+    static const char CHARS[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-";
+    const project_seq_t *q;
+    if (e == VT_ENC_NAME && shift)
+        app.name_pos = (uint8_t)app_clamp((int32_t)app.name_pos + steps, 0, PROJECT_NAME - 2);
+    if (e == VT_ENC_NAME && !shift) {    /* the character at the name's cursor: through CHARS, stopping at the ends */
+        char name[PROJECT_NAME];
+        const char *n = project_ins_name(app.ins);
+        uint32_t k, c = 0, end = 0;
+        for (k = 0; k + 1u < PROJECT_NAME; k++)
+            name[k] = end || !n[k] ? (end = 1, ' ') : n[k];   /* (padded with spaces) */
+        name[PROJECT_NAME - 1u] = 0;
+        while (CHARS[c] && CHARS[c] != name[app.name_pos])
+            c++;
+        c = (uint32_t)app_clamp((int32_t)(CHARS[c] ? c : 0u) + steps, 0, (int32_t)sizeof CHARS - 2);
+        name[app.name_pos] = CHARS[c];
+        project_set_ins_name(app.ins, name);
+    }
+    if (e == VT_ENC_STEP)
+        app.step = (uint8_t)app_clamp((int32_t)app.step + steps, 0, PROJECT_SEQ_STEPS - 1);
+    if (e == VT_ENC_SEQ)
+        app.seq = (uint8_t)app_clamp((int32_t)app.seq + steps, 0, PROJECT_SEQS - 1);
+    q = project_seq(app.ins, app.seq);
+    if (e == VT_ENC_VALUE) {             /* (past the end: from what the step holds; the sequence grows to it) */
+        int32_t v = q->v[app.step] + steps;
+        if (app.seq == PROJECT_SEQ_DUTY && app_noise())   /* the noise's mode: 0..1 */
+            v = app_clamp(v, 0, 1);
+        project_set_step(app.ins, app.seq, app.step, v);
+    }
+    if (e == VT_ENC_LEN)
+        project_set_len(app.ins, app.seq, (int32_t)q->len + steps);
+    if (e == VT_ENC_LOOP || e == VT_ENC_RELEASE) {   /* none (-1), then the steps 00 .. the last */
+        int32_t k = e == VT_ENC_LOOP ? q->loop : q->release;
+        k = app_clamp((k == PROJECT_SEQ_NONE ? -1 : k) + steps, -1, (int32_t)q->len - 1);
+        if (e == VT_ENC_LOOP)
+            project_set_loop(app.ins, app.seq, k < 0 ? PROJECT_SEQ_NONE : (uint32_t)k);
+        else
+            project_set_release(app.ins, app.seq, k < 0 ? PROJECT_SEQ_NONE : (uint32_t)k);
+    }
+}
+
+/* a pad hit in the editor: its instrument edited; with shift, a free slot's: the instrument copied there, the copy
+ * edited (shift + another instrument's: nothing) */
+static void app_editor_pad(uint32_t p, uint32_t shift)
+{
+    if (shift ? project_ins_copy(app.ins, p) : app_ins_offered(p)) {
+        app.ins = (uint8_t)p;
+        app.last[PROJECT_F_INS] = (uint8_t)PROJECT_INS(p);
+    }
+}
+
 /* a pad newly hit: the cursor to its row of the page (past the end: nothing); in instrument mode its instrument
  * selected (one of another chip or a free slot: nothing) */
 static void app_pads(void)
 {
-    uint32_t p, held = 0;
+    uint32_t p, held = 0, shift = fm1_in.buttons >> SMK_BTN_KNOB_BANK & 1u;
     for (p = 0; p < SMK_NPAD; p++)
         held |= (uint32_t)((fm1_in.pad_st[p] & 0x80u) != 0) << p;
     for (p = 0; p < SMK_NPAD; p++) {
         if (!((held & ~app.pads_held) >> p & 1u))
             continue;
-        if (app.pad_ins && app_ins_offered(p)) {
+        if (app.view == VT_VIEW_EDITOR) {
+            app_editor_pad(p, shift);
+        } else if (app.pad_ins && app_ins_offered(p)) {
             app.ins = (uint8_t)p;
             app.last[PROJECT_F_INS] = (uint8_t)PROJECT_INS(p);
         } else if (!app.pad_ins && app_page() + p < project_rows(app.track)) {
@@ -318,9 +446,13 @@ static void app_input(void)          /* take every input event */
         app.rec ^= 1u;
     if (pressed >> SMK_BTN_NOTE_REPEAT & 1u)
         app.pad_ins ^= 1u;
-    if (pressed >> SMK_BTN_LEFT & 1u)
+    if (pressed >> SMK_BTN_PATCH & 1u)
+        app_view(VT_VIEW_EDITOR);
+    if (pressed >> SMK_BTN_SEQ & 1u)
+        app_view(VT_VIEW_PATTERN);
+    if (app.view == VT_VIEW_PATTERN && pressed >> SMK_BTN_LEFT & 1u)
         app_page_or_pattern(-1, shift);
-    if (pressed >> SMK_BTN_RIGHT & 1u)
+    if (app.view == VT_VIEW_PATTERN && pressed >> SMK_BTN_RIGHT & 1u)
         app_page_or_pattern(1, shift);
     fm1_input_note_edges();
     while (smk_extkey_take() >= 0)
@@ -329,6 +461,10 @@ static void app_input(void)          /* take every input event */
         int32_t s = fm1_enc_take(e);
         if (!s)
             continue;
+        if (app.view == VT_VIEW_EDITOR) {
+            app_editor_edit(e, s, shift);
+            continue;
+        }
         if (e == VT_ENC_CURSOR && shift) {   /* shift + K2: the pattern's length */
             project_set_rows(app.track, (int32_t)project_rows(app.track) + s);
             app_cursor(app.cursor);
@@ -485,13 +621,145 @@ static void app_draw(void)           /* the header if it changed, then each line
     }
 }
 
+static void app_signed(int32_t v, uint32_t plus, char *s)   /* v as 12, -3, 0; with plus +12 */
+{
+    uint32_t n = 0, m = (uint32_t)(v < 0 ? -v : v);
+    if (v < 0 || (v && plus))
+        s[n++] = v < 0 ? '-' : '+';
+    if (m >= 100u)
+        s[n++] = (char)('0' + m / 100u);
+    if (m >= 10u)
+        s[n++] = (char)('0' + m / 10u % 10u);
+    s[n++] = (char)('0' + m % 10u);
+    s[n] = 0;
+}
+
+static int32_t app_point(int32_t x, const char *what, uint32_t k, uint16_t ink)   /* "LOOP 03", "LOOP --" */
+{
+    char s[12];
+    uint32_t n = 0;
+    while (*what)
+        s[n++] = *what++;
+    s[n++] = ' ';
+    if (k == PROJECT_SEQ_NONE)
+        s[n] = s[n + 1u] = '-', s[n + 2u] = 0;
+    else
+        s[n] = (char)('0' + k / 10u), s[n + 1u] = (char)('0' + k % 10u), s[n + 2u] = 0;
+    return cv_text(x, 1, &AF_S, s, ink) + 10;
+}
+
+/* sequence s's panel: its name, length, loop and release points (the selected one: the cursor's step and value);
+ * its steps as bars (from the bottom, or from the middle for the signed arpeggio and pitch), the length's steps on a
+ * lighter ground, the loop and release points as lines before their steps, the cursor's step brighter */
+static void app_draw_panel(uint32_t s, const vt_panel_t *pl)
+{
+    static const char *const NAME[PROJECT_SEQS] = {"VOL", "ARP", "PITCH", "DUTY"};
+    const project_seq_t *q = &pl->q;
+    uint16_t bg = pl->sel ? VT_C_SEQ_SEL : VT_C_BG;
+    int32_t lo = PROJECT_SEQ_MIN[s], hi = PROJECT_SEQ_MAX[s], y0 = VT_SEQ_LABEL_H, zero, x, k;
+    char t[8];
+    cv_begin(240, VT_SEQ_H, bg);
+    cv_text(4, 1, &AF_S, s == PROJECT_SEQ_DUTY && pl->mode ? "MODE" : NAME[s], pl->sel ? VT_C_TEXT : VT_C_HEAD_DIM);
+    memcpy(t, "LEN ", 4);
+    t[4] = (char)('0' + q->len / 10u);
+    t[5] = (char)('0' + q->len % 10u);
+    t[6] = 0;
+    x = cv_text(VT_GRAPH_X, 1, &AF_S, t, VT_C_HEAD_DIM) + 10;
+    x = app_point(x, "LOOP", q->loop, VT_C_LOOP);
+    app_point(x, "REL", q->release, VT_C_RELEASE);
+    if (pl->sel) {                       /* the cursor's step and its value */
+        app_hex(pl->step, 2, t);
+        cv_text(4, y0 + 3, &AF_S, t, VT_C_HEAD_DIM);
+        if (pl->step < q->len)
+            app_signed(q->v[pl->step], lo < 0, t);
+        else
+            memcpy(t, "..", 3);
+        cv_text(4, y0 + 19, &AF_S, t, VT_C_TEXT);
+    }
+    zero = lo < 0 ? y0 + VT_GRAPH_H / 2 : y0 + VT_GRAPH_H - 1;
+    for (k = 0; k < (int32_t)PROJECT_SEQ_STEPS; k++) {
+        int32_t bx = VT_GRAPH_X + k * VT_STEP_W, v, h;
+        uint16_t ground = k < q->len ? VT_C_GRAPH : VT_C_GRAPH_PAST;
+        if (pl->sel && k == pl->step)
+            ground = VT_C_STEP;
+        cv_rect(bx, y0, VT_STEP_W - 1, VT_GRAPH_H, ground);
+        if (k >= q->len)
+            continue;
+        v = q->v[k];
+        if (lo < 0)                      /* signed: up or down from the middle */
+            h = v * (VT_GRAPH_H / 2 - 1) / hi;
+        else
+            h = (v - lo) * (VT_GRAPH_H - 1) / (hi - lo);
+        if (h >= 0)
+            cv_rect(bx, zero - h, VT_STEP_W - 1, h + 1, pl->sel && k == pl->step ? VT_C_BAR_STEP : VT_C_BAR);
+        else
+            cv_rect(bx, zero, VT_STEP_W - 1, 1 - h, pl->sel && k == pl->step ? VT_C_BAR_STEP : VT_C_BAR);
+    }
+    if (q->loop != PROJECT_SEQ_NONE)
+        cv_rect(VT_GRAPH_X + q->loop * VT_STEP_W - 1, y0, 1, VT_GRAPH_H, VT_C_LOOP);
+    if (q->release != PROJECT_SEQ_NONE)
+        cv_rect(VT_GRAPH_X + q->release * VT_STEP_W - 1, y0, 1, VT_GRAPH_H, VT_C_RELEASE);
+    cv_blit(0, VT_HEAD_H + s * VT_SEQ_H);
+}
+
+static uint32_t app_editor_head_key(void)   /* what the editor's header shows, as one word (never 0) */
+{
+    const char *n = project_ins_name(app.ins);
+    uint32_t h = 1u | (uint32_t)app.ins << 1 | (uint32_t)app.track << 5 | (uint32_t)app.name_pos << 7, i;
+    for (i = 0; n[i]; i++)
+        h = h * 31u + (uint8_t)n[i];
+    return h | 1u;
+}
+
+static void app_editor_head(void)     /* INSxx and its name (the name's cursor under it), the chip; the track */
+{
+    char s[8];
+    int32_t x;
+    cv_begin(240, VT_HEAD_H, VT_C_HEAD);
+    memcpy(s, "INS", 3);
+    app_hex(app.ins, 2, s + 3);
+    cv_text(8, 1, &AF_S, s, VT_C_INS);
+    cv_text_mono(VT_NAME_X, 1, &AF_S, project_ins_name(app.ins), VT_C_INS, VT_C_HEAD, VT_PITCH);
+    cv_rect(VT_NAME_X + app.name_pos * VT_PITCH, 14, VT_PITCH - 1, 1, VT_C_INS);
+    cv_text_r(232, 1, &AF_S, "NES", VT_C_HEAD_DIM, VT_C_HEAD);
+    s[0] = 'T';
+    s[1] = (char)('1' + app.track);
+    s[2] = 0;
+    x = cv_text(8, 15, &AF_S, s, VT_C_HEAD_DIM);
+    cv_text(x + 8, 15, &AF_S, player_track_name(app.track), VT_C_HEAD_DIM);
+    cv_blit(0, 0);
+}
+
+static void app_editor_draw(void)     /* the editor: the header if it changed, then each panel that changed */
+{
+    uint32_t s;
+    if (app.head != app_editor_head_key()) {
+        app_editor_head();
+        app.head = app_editor_head_key();
+    }
+    for (s = 0; s < PROJECT_SEQS; s++) {
+        vt_panel_t pl;
+        memset(&pl, 0, sizeof pl);
+        pl.q = *project_seq(app.ins, s);
+        pl.ins = app.ins;
+        pl.sel = s == app.seq;
+        pl.step = pl.sel ? app.step : 0u;
+        pl.mode = (uint8_t)app_noise();
+        if (memcmp(&pl, &app.panel[s], sizeof pl)) {
+            app_draw_panel(s, &pl);
+            app.panel[s] = pl;
+        }
+    }
+}
+
 /* the pads: the rows of the page, or the instruments; SEQ PLAY, SEQ REC, NOTE REPEAT */
 static void app_leds(void)
 {
     uint32_t p, page = app_page(), playing = player_playing(), prow = player_row();
     for (p = 0; p < SMK_NPAD; p++) {
         uint32_t row = page + p;
-        const uint8_t *c = app.pad_ins ? (p == app.ins ? VT_PAD_INS_SEL : app_ins_offered(p) ? VT_PAD_INS : VT_PAD_PAST)
+        const uint8_t *c = app.pad_ins || app.view == VT_VIEW_EDITOR
+                               ? (p == app.ins ? VT_PAD_INS_SEL : app_ins_offered(p) ? VT_PAD_INS : VT_PAD_PAST)
                            : row >= project_rows(app.track) ? VT_PAD_PAST
                            : playing && row == prow   ? VT_PAD_PLAYING
                            : row == app.cursor      ? VT_PAD_CURSOR
@@ -502,12 +770,16 @@ static void app_leds(void)
     fm1_led_key(SMK_BTN_SEQ_PLAY, playing);
     fm1_led_key(SMK_BTN_SEQ_REC, app.rec);
     fm1_led_key(SMK_BTN_NOTE_REPEAT, app.pad_ins);
+    fm1_led_key(SMK_BTN_PATCH, app.view == VT_VIEW_EDITOR);
 }
 
 static void app_frame(void)
 {
     app_input();
-    app_draw();
+    if (app.view == VT_VIEW_EDITOR)
+        app_editor_draw();
+    else
+        app_draw();
     app_leds();
 }
 

@@ -18,7 +18,10 @@
 #                   track, the playing row on the screen; the screen in build/host/view.ppm.
 #                   tests/vt_instrument_test.c: NES instruments (volume, arpeggio, pitch, duty sequences a frame a
 #                   step, row volume scaling, release and cut, the factory drums), NOTE REPEAT's instrument mode on
-#                   the pads; the screen in build/host/instrument.ppm.
+#                   the pads (the instruments set with the editor); the screen in build/host/instrument.ppm.
+#                   tests/vt_editor_test.c: the instrument editor (PATCH: four sequences as bar graphs, no text cut;
+#                   steps, length, loop and release by the encoders, heard at once; renaming, copying to a free
+#                   slot); the screen in build/host/editor.ppm.
 # NES chip core (seam B, tests/nes_test.c): register states in, samples out: duty waveforms, period -> frequency,
 #                   the triangle's staircase, the noise's periods and LFSR modes, the 2A03 mixer, no aliasing on
 #                   high notes.
@@ -127,6 +130,9 @@ run "DEVICE: the tracker view; K5 to K8 edit a row; length, pages, 32 patterns a
 $CC $VT -o "$OUT/vt_instrument_test" tests/vt_instrument_test.c -lm
 run "DEVICE: NES instruments: sequences a frame a step, row volume, release and cut, factory drums, instrument pads" \
     "$OUT/vt_instrument_test" "$OUT"
+$CC $VT -o "$OUT/vt_editor_test" tests/vt_editor_test.c -lm
+run "DEVICE: the instrument editor (PATCH): bar graphs, steps, length, loop, release, name, copy; heard at once" \
+    "$OUT/vt_editor_test" "$OUT"
 
 # seam B: the NES chip core alone
 $CC -o "$OUT/nes_test" tests/nes_test.c -lm
@@ -181,6 +187,8 @@ else
     run "ASan/UBSan: DEVICE, the tracker view and field entry" "$A/vt_view_test"
     $SCC $VT -o "$A/vt_instrument_test" tests/vt_instrument_test.c -lm
     run "ASan/UBSan: DEVICE, NES instruments" "$A/vt_instrument_test"
+    $SCC $VT -o "$A/vt_editor_test" tests/vt_editor_test.c -lm
+    run "ASan/UBSan: DEVICE, the instrument editor" "$A/vt_editor_test"
     $SCC -o "$A/nes_test" tests/nes_test.c -lm
     run "ASan/UBSan: NES chip core" "$A/nes_test"
 fi
