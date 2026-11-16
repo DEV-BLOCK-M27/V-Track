@@ -27,6 +27,18 @@
  * frame (+ lower; the noise: its period index), duty steps set the pulse duty (0..3) or the noise mode (0 long, 1
  * short). Without an instrument (none set, a free slot, another chip's) a note plays as a plain tone: the pulses at
  * 50 % duty, the noise long, full volume times the row volume; a release silences it.
+ * A row's effect column (FamiTracker's notation and behaviour) acts on the pattern's notes of the track, a NES frame
+ * at a time; a note's frame 0 has the lasting effects once already. Lasting until replaced or cleared with 00:
+ * 0xy arpeggio (the note, + x, + y semitones a frame each; without y the note and + x), 1xx / 2xx slide up / down
+ * (the period xx lower / higher a frame), 3xx portamento (a note glides from the one sounding to its pitch, xx a
+ * frame, without starting anew); these four are one effect, a new one replaces the other (a slide stops where it
+ * is, and one replacing 0xy goes on from the arpeggio's note). 4xy vibrato (FamiTracker's sine: 64 phases, x a frame, depth y), Axy volume slide (the row volume x / 8 up,
+ * y / 8 down a frame; a volume column sets it again). Vxx sets the duty (mode) from now on, new notes too; a duty
+ * sequence overrides it. Gxx delays the row's note, instrument and volume xx frames from the row's start (to the
+ * next row's start at the latest), Sxx cuts the note sounding xx frames from the row's start (S00 at once; not
+ * past the next row's start). With an instrument: an
+ * arpeggio sequence running wins over 0xy (ended, 0xy plays); the volume slide is the row volume the sequence
+ * volume is scaled by. A new note keeps the lasting effects, its slide starts from its own pitch.
  * A live note held on a track sounds over what the pattern plays there, with its own instrument, at full row
  * volume; its key up silences it and gives the channel back to the pattern. The noise's period comes from the note
  * as in FamiTracker: 15 - note mod 16, so a higher note a shorter period, wrapping every 16 notes. */
@@ -47,11 +59,45 @@ static const char *const PLAYER_NAME[PLAYER_TRACKS] = {"NES \xB7 PULSE 1", "NES 
 #define PLAYER_FRAME_UNITS (FS * 10000u) /* a frame: PLAYER_FRAME_UNITS / PLAYER_FRAME_HZ samples */
 #define PLAYER_SEQ_END 0xFFu             /* a sequence past its end: its last value holds */
 
+#define PLAYER_EFFECT_NONE 0u                /* the lasting pitch effects (one at a time, as in FamiTracker) */
+#define PLAYER_EFFECT_ARP 1u                 /* 0xy */
+#define PLAYER_EFFECT_UP 2u                  /* 1xx */
+#define PLAYER_EFFECT_DOWN 3u                /* 2xx */
+#define PLAYER_EFFECT_PORTA 4u               /* 3xx */
+#define PLAYER_VOL_MAX 0x7Fu             /* the row volume, Q3 (FamiTracker's: Axy slides it in eighths) */
+#define PLAYER_NO_FRAME 0xFFFFu          /* no Gxx / Sxx waiting */
+
+/* FamiTracker's vibrato (its new mode): a quarter sine of depth 4xy's y, by phase 0..15 */
+static const uint8_t PLAYER_VIB[16][16] = {
+    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1},
+    {0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2},
+    {0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3},
+    {0, 0, 0, 1, 1, 2, 2, 3, 3, 3, 4, 4, 4, 4, 4, 4},
+    {0, 0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 6, 6, 6},
+    {0, 0, 1, 2, 3, 4, 5, 6, 7, 7, 8, 8, 9, 9, 9, 9},
+    {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 10, 11, 11, 11, 11},
+    {0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 12, 13, 13, 13},
+    {0, 1, 3, 4, 6, 8, 9, 10, 12, 13, 14, 14, 15, 16, 16, 16},
+    {0, 2, 4, 6, 8, 10, 12, 13, 15, 17, 18, 19, 20, 21, 21, 21},
+    {0, 2, 5, 8, 11, 14, 16, 19, 21, 23, 24, 26, 27, 28, 29, 29},
+    {0, 4, 8, 12, 16, 20, 24, 27, 31, 34, 36, 38, 40, 42, 43, 43},
+    {0, 6, 12, 18, 24, 30, 35, 40, 45, 49, 53, 56, 59, 61, 62, 63},
+    {0, 9, 18, 27, 36, 45, 53, 60, 67, 74, 79, 84, 88, 91, 94, 95},
+    {0, 12, 24, 37, 48, 60, 71, 81, 90, 98, 106, 112, 118, 122, 125, 127}};
+
 typedef struct {                         /* what plays on a track: the pattern's, or a live note */
     uint8_t note;                        /* MIDI number + 1; 0 = silent */
     uint8_t ins;                         /* the instrument playing, 0..15 or PLAYER_NO_INS */
-    uint8_t vol;                         /* the row volume 0..15 */
+    uint8_t vol;                         /* the row volume, Q3: 0..PLAYER_VOL_MAX */
     uint8_t released;
+    uint8_t effect, effect_p;                    /* the lasting pitch effect (PLAYER_EFFECT_*) and its parameter */
+    uint8_t arp_state;                   /* 0xy: 0 the note, 1 + x, 2 + y */
+    int8_t effect_arp;                       /* 0xy: the semitones it adds this frame */
+    int16_t slide;                       /* 1xx, 2xx, 3xx: the period's offset so far */
+    uint8_t vib_speed, vib_depth, vib_phase;   /* 4xy: speed x, depth y, the phase 0..63 */
+    uint8_t vol_slide;                   /* Axy: up x, down y eighths of a volume step a frame */
+    uint8_t def_duty;                    /* Vxx: the duty (mode) a note starts with */
     uint8_t pos[PROJECT_SEQS];           /* each sequence's step, or PLAYER_SEQ_END */
     uint8_t s_vol, s_duty;               /* the volume and duty sequences' values now */
     int8_t s_arp;
@@ -69,6 +115,10 @@ static struct {
     uint32_t live_seen[PLAYER_TRACKS];   /* the audio ISR's own: the live word its voice plays */
     player_voice_t voice[PLAYER_TRACKS][2];   /* [0] the pattern's, [1] the live note's */
     uint8_t ins[PLAYER_TRACKS];          /* each track's instrument (the rows set it) */
+    uint32_t racc[PLAYER_TRACKS];        /* the row's frame time so far, in 1 / PLAYER_FRAME_HZ samples, */
+    uint16_t rframe[PLAYER_TRACKS];      /* its frames so far, */
+    uint16_t delay[PLAYER_TRACKS], cut[PLAYER_TRACKS];   /* Gxx's and Sxx's frame, or PLAYER_NO_FRAME */
+    uint8_t dnote[PLAYER_TRACKS], dins[PLAYER_TRACKS], dvol[PLAYER_TRACKS];   /* Gxx: the row's fields waiting */
     volatile uint8_t req;                /* PLAYER_REQ_*: from the main loop to the audio ISR, 0 = taken */
     volatile uint8_t playing, row;
     uint8_t count;                       /* the main loop's note-on count */
@@ -111,7 +161,9 @@ static void player_init(void)
     for (i = 0; i < PLAYER_TRACKS; i++) {
         player.live[i] = player.live_seen[i] = 0;
         player.ins[i] = PLAYER_NO_INS;
-        player.voice[i][0].vol = player.voice[i][1].vol = 15;
+        player.voice[i][0].vol = player.voice[i][1].vol = PLAYER_VOL_MAX;
+        player.voice[i][0].def_duty = player.voice[i][1].def_duty = i == PLAYER_NOISE ? 0u : 2u;
+        player.delay[i] = player.cut[i] = PLAYER_NO_FRAME;
     }
     player.req = player.playing = player.row = player.count = 0;
 }
@@ -134,25 +186,70 @@ static void player_note_off(uint32_t track, uint32_t note)
         player.live[track] = 0;
 }
 
-/* --- a voice: its instrument's sequences (the audio ISR; once a frame or a row, out of the per-block loop) --- */
+/* --- a voice: its instrument's sequences and its effects (the audio ISR; once a frame or a row, out of the
+ * per-block loop) --- */
+
+static int32_t player_period_max(uint32_t t) { return t == PLAYER_NOISE ? 15 : 0x7FF; }   /* the register's */
+
+static int32_t player_voice_base(uint32_t t, const player_voice_t *v)   /* the period of its note, arpeggio and
+                                                                         * pitch sequence, before the effects */
+{
+    int32_t n = (int32_t)v->note - 1;
+    /* an arpeggio sequence running wins over 0xy; ended, it leaves its last value, unless 0xy plays */
+    n += v->pos[PROJECT_SEQ_ARP] == PLAYER_SEQ_END && v->effect == PLAYER_EFFECT_ARP ? v->effect_arp : v->s_arp;
+    n = n < 0 ? 0 : n > 127 ? 127 : n;
+    return (int32_t)player_period(t, (uint32_t)n) + v->pitch;
+}
+
+static int32_t player_vibrato(const player_voice_t *v)   /* 4xy's period offset now: a sine over 64 phases */
+{
+    uint32_t ph = v->vib_phase;
+    const uint8_t *q = PLAYER_VIB[v->vib_depth];
+    if (!v->vib_speed)
+        return 0;
+    return ph < 16u ? q[ph] : ph < 32u ? q[31u - ph] : ph < 48u ? -(int32_t)q[ph - 32u] : -(int32_t)q[63u - ph];
+}
 
 static void player_voice_out(uint32_t t, player_voice_t *v)   /* its register state from where it is */
 {
-    int32_t n = (int32_t)v->note - 1 + v->s_arp, p;
-    uint32_t vol = v->vol * (uint32_t)v->s_vol / 15u;
-    if (!vol && v->vol && v->s_vol)
+    int32_t p, max = player_period_max(t);
+    uint32_t vol = (v->vol >> 3) * (uint32_t)v->s_vol / 15u;
+    if (!vol && v->vol && v->s_vol)      /* (the eighths: a volume slide fading out holds 1, as in FamiTracker) */
         vol = 1;
     if (!v->note)
         vol = 0;
-    n = n < 0 ? 0 : n > 127 ? 127 : n;
-    p = (int32_t)player_period(t, (uint32_t)n) + v->pitch;
-    if (t == PLAYER_NOISE)
-        p = p < 0 ? 0 : p > 15 ? 15 : p;
-    else
-        p = p < 0 ? 0 : p > 0x7FF ? 0x7FF : p;
+    p = player_voice_base(t, v) + v->slide - player_vibrato(v);
+    p = p < 0 ? 0 : p > max ? max : p;
     v->period = (uint16_t)p;
     v->duty = t == PLAYER_NOISE ? v->s_duty & 1u : v->s_duty & 3u;
     v->volume = (uint8_t)vol;
+}
+
+static void player_voice_effects(uint32_t t, player_voice_t *v)   /* a frame of its effects */
+{
+    int32_t b, max = player_period_max(t), s = v->slide, p = v->effect_p, vol;
+    if (v->effect == PLAYER_EFFECT_ARP) {        /* the note, + x, + y (none without y), a frame each */
+        v->effect_arp = (int8_t)(v->arp_state == 0u ? 0 : v->arp_state == 1u ? p >> 4 : p & 15);
+        if (v->arp_state == 1u && !(p & 15))
+            v->arp_state = 2;
+        v->arp_state = (uint8_t)((v->arp_state + 1u) % 3u);
+        s = 0;                           /* (it sets the note's period: slides so far are gone) */
+    } else if (v->effect == PLAYER_EFFECT_UP) {
+        s -= p;
+    } else if (v->effect == PLAYER_EFFECT_DOWN) {
+        s += p;
+    } else if (v->effect == PLAYER_EFFECT_PORTA) {   /* towards the note */
+        s = s > p ? s - p : s < -p ? s + p : 0;
+    }
+    b = player_voice_base(t, v);         /* the period stays within the register's range */
+    v->slide = (int16_t)(b + s < 0 ? -b : b + s > max ? max - b : s);
+    if (v->vib_speed)
+        v->vib_phase = (uint8_t)((v->vib_phase + v->vib_speed) & 63u);
+    if (v->vol_slide) {
+        vol = (int32_t)v->vol - (v->vol_slide & 15u);
+        vol = (vol < 0 ? 0 : vol) + (v->vol_slide >> 4);
+        v->vol = (uint8_t)(vol > (int32_t)PLAYER_VOL_MAX ? PLAYER_VOL_MAX : vol);
+    }
 }
 
 static void player_voice_step(player_voice_t *v)   /* each sequence's value at its step */
@@ -184,10 +281,13 @@ static void player_voice_next(player_voice_t *v)   /* a frame: each sequence a s
 {
     uint32_t s;
     for (s = 0; s < PROJECT_SEQS; s++) {
-        const project_seq_t *q = project_seq(v->ins, s);
-        uint32_t pos = v->pos[s], loop = q->loop, rel = q->release;
+        const project_seq_t *q;
+        uint32_t pos = v->pos[s], loop, rel;
         if (pos == PLAYER_SEQ_END)
             continue;
+        q = project_seq(v->ins, s);
+        loop = q->loop;
+        rel = q->release;
         if (!v->released && rel != PROJECT_SEQ_NONE && pos == rel)   /* the release point: loop back or hold */
             pos = loop != PROJECT_SEQ_NONE && loop < rel ? loop : rel;
         else if (pos + 1u < q->len)
@@ -201,6 +301,8 @@ static void player_voice_next(player_voice_t *v)   /* a frame: each sequence a s
     player_voice_step(v);
 }
 
+/* a note starts: its instrument's sequences from their first step, the lasting effects on it from their start (its
+ * frame 0 has them once, as in FamiTracker) */
 static void player_voice_start(uint32_t t, player_voice_t *v, uint32_t note, uint32_t ins)
 {
     uint32_t s;
@@ -209,13 +311,24 @@ static void player_voice_start(uint32_t t, player_voice_t *v, uint32_t note, uin
     v->released = 0;
     v->s_vol = 15;
     v->s_arp = 0;
-    v->s_duty = t == PLAYER_NOISE ? 0u : 2u;
+    v->s_duty = v->def_duty;
     v->pitch = 0;
     v->acc = 0;
+    v->arp_state = 0;
+    v->effect_arp = 0;
+    v->slide = 0;
     for (s = 0; s < PROJECT_SEQS; s++)
         v->pos[s] = v->ins == PLAYER_NO_INS ? PLAYER_SEQ_END : 0u;
     player_voice_step(v);
+    player_voice_effects(t, v);
     player_voice_out(t, v);
+}
+
+static void player_voice_reset(uint32_t t, player_voice_t *v)   /* silent, no effects, full volume */
+{
+    memset(v, 0, sizeof *v);
+    v->vol = PLAYER_VOL_MAX;
+    v->def_duty = t == PLAYER_NOISE ? 0u : 2u;   /* a plain tone: the pulses 50 %, the noise long */
 }
 
 static void player_voice_release(uint32_t t, player_voice_t *v)
@@ -237,27 +350,97 @@ static void player_voice_release(uint32_t t, player_voice_t *v)
     player_voice_out(t, v);
 }
 
-/* the audio ISR, once a block: the voices' frames, the live notes asked for */
+/* a row's instrument, volume and note fields on track t (at its start, or Gxx frames later) */
+static void player_row_fields(uint32_t t, uint32_t note, uint32_t ins, uint32_t vol)
+{
+    player_voice_t *pv = &player.voice[t][0];
+    if (ins != PROJECT_EMPTY)
+        player.ins[t] = (uint8_t)(ins - 1u);
+    if (vol != PROJECT_EMPTY)
+        pv->vol = (uint8_t)((vol - 1u) << 3);
+    if (PROJECT_IS_NOTE(note)) {
+        if (pv->effect == PLAYER_EFFECT_PORTA && pv->note) {   /* 3xx: the note glides there, not started anew */
+            int32_t from = player_voice_base(t, pv) + pv->slide;
+            pv->note = (uint8_t)note;
+            pv->slide = (int16_t)(from - player_voice_base(t, pv));
+        } else {
+            player_voice_start(t, pv, note - 1u, player.ins[t]);
+        }
+    } else if (note == PROJECT_RELEASE) {
+        player_voice_release(t, pv);
+    } else if (note == PROJECT_CUT) {
+        pv->note = 0;
+    }
+    player_voice_out(t, pv);
+}
+
+static void player_effect(uint32_t t, player_voice_t *v, uint32_t e)   /* a row's effect on track t */
+{
+    uint32_t p = e & 0xFFu, c = e >> 8;
+    if (v->effect == PLAYER_EFFECT_ARP && c >= '0' && c <= '3') {   /* 0xy replaced: its note's period stays */
+        int32_t from = player_voice_base(t, v) + v->slide;
+        v->effect = PLAYER_EFFECT_NONE;
+        v->slide = (int16_t)(from - player_voice_base(t, v));
+    }
+    switch (c) {
+    case '0': v->effect = (uint8_t)(p ? PLAYER_EFFECT_ARP : PLAYER_EFFECT_NONE); break;
+    case '1': v->effect = (uint8_t)(p ? PLAYER_EFFECT_UP : PLAYER_EFFECT_NONE); break;
+    case '2': v->effect = (uint8_t)(p ? PLAYER_EFFECT_DOWN : PLAYER_EFFECT_NONE); break;
+    case '3': v->effect = (uint8_t)(p ? PLAYER_EFFECT_PORTA : PLAYER_EFFECT_NONE); break;
+    case '4':
+        v->vib_speed = (uint8_t)(p >> 4);
+        v->vib_depth = (uint8_t)(p & 15u);
+        if (!v->vib_speed)
+            v->vib_phase = 0;
+        return;
+    case 'A': v->vol_slide = (uint8_t)p; return;
+    case 'V': v->def_duty = v->s_duty = (uint8_t)p; return;
+    case 'G': player.delay[t] = (uint16_t)(p ? p : PLAYER_NO_FRAME); return;
+    case 'S': player.cut[t] = (uint16_t)p; return;
+    default: return;
+    }
+    v->effect_p = (uint8_t)p;
+}
+
+static void player_delayed(uint32_t t)   /* Gxx's waiting row fields, now */
+{
+    player.delay[t] = PLAYER_NO_FRAME;
+    player_row_fields(t, player.dnote[t], player.dins[t], player.dvol[t]);
+}
+
+/* the audio ISR, once a block: the rows' Gxx and Sxx, the voices' frames, the live notes asked for */
 static __attribute__((noinline)) void player_voices(uint32_t k)
 {
     uint32_t t, i;
     for (t = 0; t < PLAYER_TRACKS; t++) {
         uint32_t l = player.live[t];
+        if ((player.delay[t] & player.cut[t]) != PLAYER_NO_FRAME) {   /* a frame clock from the row's start */
+            if ((player.racc[t] += k * PLAYER_FRAME_HZ) >= PLAYER_FRAME_UNITS) {
+                player.racc[t] -= PLAYER_FRAME_UNITS;
+                player.rframe[t]++;
+            }
+            if (player.rframe[t] >= player.delay[t])
+                player_delayed(t);
+            if (player.rframe[t] >= player.cut[t]) {
+                player.cut[t] = PLAYER_NO_FRAME;
+                player.voice[t][0].note = 0;
+                player_voice_out(t, &player.voice[t][0]);
+            }
+        }
         if (l != player.live_seen[t]) {
             player.live_seen[t] = l;
-            player.voice[t][1].vol = 15;
+            player_voice_reset(t, &player.voice[t][1]);
             if (l >> 16 & 0xFFu)
                 player_voice_start(t, &player.voice[t][1], (l >> 16 & 0xFFu) - 1u, l & 0xFFu);
-            else
-                player.voice[t][1].note = 0;
         }
         for (i = 0; i < 2u; i++) {
             player_voice_t *v = &player.voice[t][i];
-            if (!v->note || v->ins == PLAYER_NO_INS)
+            if (!v->note)
                 continue;
             if ((v->acc += k * PLAYER_FRAME_HZ) >= PLAYER_FRAME_UNITS) {
                 v->acc -= PLAYER_FRAME_UNITS;
                 player_voice_next(v);
+                player_voice_effects(t, v);
                 player_voice_out(t, v);
             }
         }
@@ -274,26 +457,35 @@ static uint32_t player_rows(void)        /* the loop: as long as the longest of 
     return n;
 }
 
-/* the audio ISR, once a row: its instruments, volumes and notes; past the loop's end, row 0 */
+/* the audio ISR, once a row: a note still delayed (Gxx) plays now; then the row's effect, instrument, volume and
+ * note (Gxx: those later); past the loop's end, row 0 */
 static __attribute__((noinline)) void player_row_start(uint32_t row)
 {
-    uint32_t t, v;
+    uint32_t t, note, ins, vol;
     if (row >= player_rows())
         row = 0;
     player.row = (uint8_t)row;
     for (t = 0; t < PLAYER_TRACKS; t++) {
         player_voice_t *pv = &player.voice[t][0];
-        if ((v = project_field(t, row, PROJECT_F_INS)) != PROJECT_EMPTY)
-            player.ins[t] = (uint8_t)(v - 1u);
-        if ((v = project_field(t, row, PROJECT_F_VOL)) != PROJECT_EMPTY)
-            pv->vol = (uint8_t)(v - 1u);
-        v = project_field(t, row, PROJECT_F_NOTE);
-        if (PROJECT_IS_NOTE(v))
-            player_voice_start(t, pv, v - 1u, player.ins[t]);
-        else if (v == PROJECT_RELEASE)
-            player_voice_release(t, pv);
-        else if (v == PROJECT_CUT)
+        if (player.delay[t] != PLAYER_NO_FRAME)
+            player_delayed(t);
+        player.cut[t] = PLAYER_NO_FRAME;
+        player.racc[t] = player.rframe[t] = 0;
+        player_effect(t, pv, project_field(t, row, PROJECT_F_EFFECT));
+        note = project_field(t, row, PROJECT_F_NOTE);
+        ins = project_field(t, row, PROJECT_F_INS);
+        vol = project_field(t, row, PROJECT_F_VOL);
+        if (player.delay[t] != PLAYER_NO_FRAME) {
+            player.dnote[t] = (uint8_t)note;
+            player.dins[t] = (uint8_t)ins;
+            player.dvol[t] = (uint8_t)vol;
+        } else {
+            player_row_fields(t, note, ins, vol);
+        }
+        if (!player.cut[t]) {            /* S00: at once */
+            player.cut[t] = PLAYER_NO_FRAME;
             pv->note = 0;
+        }
         player_voice_out(t, pv);
     }
 }
@@ -302,10 +494,9 @@ static __attribute__((noinline)) void player_transport(void)   /* the audio ISR:
 {
     uint32_t t;
     for (t = 0; t < PLAYER_TRACKS; t++) {
-        player.voice[t][0].note = 0;
-        player.voice[t][0].vol = 15;
-        player.voice[t][0].volume = 0;
+        player_voice_reset(t, &player.voice[t][0]);
         player.ins[t] = PLAYER_NO_INS;
+        player.delay[t] = player.cut[t] = PLAYER_NO_FRAME;
     }
     player.acc = 0;
     player.playing = player.req == PLAYER_REQ_PLAY;
