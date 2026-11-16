@@ -16,6 +16,9 @@
 #                   tests/vt_view_test.c: the tracker view (the selected track's four columns, the others' notes, no
 #                   text cut or overlapping), K5 to K8 editing the cursor row, the length, paging, 32 patterns a
 #                   track, the playing row on the screen; the screen in build/host/view.ppm.
+#                   tests/vt_instrument_test.c: NES instruments (volume, arpeggio, pitch, duty sequences a frame a
+#                   step, row volume scaling, release and cut, the factory drums), NOTE REPEAT's instrument mode on
+#                   the pads; the screen in build/host/instrument.ppm.
 # NES chip core (seam B, tests/nes_test.c): register states in, samples out: duty waveforms, period -> frequency,
 #                   the triangle's staircase, the noise's periods and LFSR modes, the 2A03 mixer, no aliasing on
 #                   high notes.
@@ -121,6 +124,9 @@ run "DEVICE: a pattern step-entered (notes, cut, release) and played looped on f
 $CC $VT -o "$OUT/vt_view_test" tests/vt_view_test.c
 run "DEVICE: the tracker view; K5 to K8 edit a row; length, pages, 32 patterns a track; the playing row shown" \
     "$OUT/vt_view_test" "$OUT"
+$CC $VT -o "$OUT/vt_instrument_test" tests/vt_instrument_test.c -lm
+run "DEVICE: NES instruments: sequences a frame a step, row volume, release and cut, factory drums, instrument pads" \
+    "$OUT/vt_instrument_test" "$OUT"
 
 # seam B: the NES chip core alone
 $CC -o "$OUT/nes_test" tests/nes_test.c -lm
@@ -173,6 +179,8 @@ else
     run "ASan/UBSan: DEVICE, a pattern entered and played" "$A/vt_pattern_test"
     $SCC $VT -o "$A/vt_view_test" tests/vt_view_test.c
     run "ASan/UBSan: DEVICE, the tracker view and field entry" "$A/vt_view_test"
+    $SCC $VT -o "$A/vt_instrument_test" tests/vt_instrument_test.c -lm
+    run "ASan/UBSan: DEVICE, NES instruments" "$A/vt_instrument_test"
     $SCC -o "$A/nes_test" tests/nes_test.c -lm
     run "ASan/UBSan: NES chip core" "$A/nes_test"
 fi

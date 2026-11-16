@@ -35,7 +35,10 @@
  *   sim_button_led(b)         1 if button b's LED is lit
  *   sim_flash(), SIM_FLASH_SIZE   the flash chip's bytes; sim_flash_writes() / sim_flash_refused(): erases and
  *                             page writes done / refused by the driver
- *   sim_save_ppm(path)        the screen as a PPM file (for looking at it) */
+ *   sim_save_ppm(path)        the screen as a PPM file (for looking at it)
+ *   sim_instrument(i, s, v, n, loop, release)  sequence s (PROJECT_SEQ_*) of instrument i set to v[0..n-1], loop and
+ *                             release a step or PROJECT_SEQ_NONE; a free slot becomes an NES instrument first. It
+ *                             stands in for the instrument editor (PATCH, #8) until that exists */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -431,6 +434,13 @@ static int sim_button_led(uint32_t b) { return b < SMK_NLED && fm1_led[b]; }
 static const uint8_t *sim_flash(void) { return sim_nor; }
 static uint32_t sim_flash_refused(void) { return sim_refused; }
 static uint32_t sim_flash_writes(void) { return sim_writes; }
+
+static void sim_instrument(uint32_t i, uint32_t seq, const int8_t *v, uint32_t n, uint32_t loop, uint32_t release)
+{
+    if (project_ins_chip(i) == PROJECT_CHIP_NONE)
+        project_ins_new(i, PROJECT_CHIP_NES, "TEST");
+    project_set_seq(i, seq, v, n, loop, release);
+}
 
 static int sim_save_ppm(const char *path)
 {

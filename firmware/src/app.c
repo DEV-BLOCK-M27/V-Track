@@ -24,8 +24,13 @@
  * With REC on and the sequencer stopped a key also writes its note into the cursor row, and shift with a white key
  * a cut, with a black key a release (shift keeps the keys from playing); the cursor then moves down a row (after
  * the last row, to the first). The pads show the 16 rows of the cursor's page: empty, a note (cut and release too),
- * the cursor, the playing row, dark past the pattern's end; a tap moves the cursor to its row. Every other input
- * (USB MIDI in too) is taken and dropped. */
+ * the cursor, the playing row, dark past the pattern's end; a tap moves the cursor to its row.
+ * NOTE REPEAT switches the pads to instrument mode and back (its LED lit in instrument mode): pads 1 to 16 are
+ * instruments 00 to 0F, those of the selected track's chip lit (the selected one brighter), the others (free slots,
+ * other chips) dark, taking no tap. A tap selects the instrument: the header shows it (INSxx and its name), the keys
+ * play it, step entry writes it into the instrument column with the note, and K6 on an empty instrument starts
+ * from it. None is selected at first (the keys play a plain tone, step entry leaves the column empty); a track of
+ * another chip drops it. Every other input (USB MIDI in too) is taken and dropped. */
 #define VT_NAME "V-Track"
 #define VT_KEY_NOTE0 48u         /* keybed key 0 = C3 (MIDI 48) */
 #define VT_ENC_TRACK 2u          /* K3: track select */
@@ -66,6 +71,7 @@
 #define VT_LINE_CURSOR 1u        /* vt_line_t.mark */
 #define VT_LINE_PLAYING 2u
 #define VT_LINE_PAST 4u          /* past the pattern's end: blank */
+#define VT_NO_INS PLAYER_NO_INS  /* no instrument selected */
 
 typedef struct {                 /* what a screen line shows: drawn again when it changes */
     uint8_t row, mark, note[PROJECT_TRACKS], ins, vol;
@@ -78,6 +84,8 @@ static struct {
     uint8_t cursor;              /* the cursor row */
     uint8_t top;                 /* the first row on the screen */
     uint8_t rec;                 /* SEQ REC on */
+    uint8_t pad_ins;             /* the pads in instrument mode */
+    uint8_t ins;                 /* the selected instrument 0..15, VT_NO_INS */
     uint8_t last[PROJECT_F_EFFECT];   /* by PROJECT_F_*: the note, instrument and volume written last (an empty
                                        * field takes it first) */
     uint64_t keys;               /* the keybed keys held at the last frame */
@@ -87,7 +95,8 @@ static struct {
 } app;
 
 static const uint8_t VT_PAD_EMPTY[3] = {2, 2, 6}, VT_PAD_NOTE[3] = {0, 20, 60}, VT_PAD_CURSOR[3] = {60, 60, 60},
-                     VT_PAD_PLAYING[3] = {0, 90, 10}, VT_PAD_PAST[3] = {0, 0, 0};   /* r g b */
+                     VT_PAD_PLAYING[3] = {0, 90, 10}, VT_PAD_PAST[3] = {0, 0, 0},   /* r g b */
+                     VT_PAD_INS[3] = {10, 40, 10}, VT_PAD_INS_SEL[3] = {60, 110, 20};
 
 static void app_name_screen(uint32_t y)   /* an empty screen with the name at row y */
 {
@@ -120,12 +129,25 @@ static void app_start(void)
     app.track = 0;
     app.cursor = app.top = 0;
     app.rec = 0;
+    app.pad_ins = 0;
+    app.ins = VT_NO_INS;
     app.last[PROJECT_F_NOTE] = PROJECT_NOTE(60u);   /* C-4 */
     app.last[PROJECT_F_INS] = PROJECT_INS(0u);
     app.last[PROJECT_F_VOL] = PROJECT_VOL(PROJECT_VOLUMES - 1u);
     app.pads_held = 0;
     app.keys = fm1_in.keys;              /* keys held already: no note until pressed again */
     lcd_fill(0, 0, 240, 240, VT_C_BG);
+}
+
+static uint32_t app_chip(uint32_t track)   /* the chip track 0..3 plays (ADR 0002; so far the NES only) */
+{
+    (void)track;
+    return PROJECT_CHIP_NES;
+}
+
+static int app_ins_offered(uint32_t i)   /* instrument i is one of the selected track's chip */
+{
+    return project_ins_chip(i) == app_chip(app.track);
 }
 
 static uint32_t app_page(void) { return app.cursor / VT_PAGE * VT_PAGE; }   /* the cursor page's first row */
@@ -165,8 +187,11 @@ static void app_page_or_pattern(int32_t dir, uint32_t shift)
 static void app_enter(uint32_t v)    /* REC, stopped: v into the cursor row, the cursor down a row */
 {
     project_set_field(app.track, app.cursor, PROJECT_F_NOTE, v);
-    if (PROJECT_IS_NOTE(v))
+    if (PROJECT_IS_NOTE(v)) {
         app.last[PROJECT_F_NOTE] = (uint8_t)v;
+        if (app.ins != VT_NO_INS)
+            project_set_field(app.track, app.cursor, PROJECT_F_INS, PROJECT_INS(app.ins));
+    }
     app_cursor(app.cursor + 1u < project_rows(app.track) ? (int32_t)app.cursor + 1 : 0);
 }
 
@@ -234,21 +259,30 @@ static void app_keys(void)           /* the keybed: releases, then the highest k
                 break;
             }
             app.key_track[k] = app.track;
-            player_note_on(app.track, VT_KEY_NOTE0 + k);
+            player_note_on(app.track, VT_KEY_NOTE0 + k, app.ins);
             if (enter)
                 app_enter(PROJECT_NOTE(VT_KEY_NOTE0 + k));
             break;
         }
 }
 
-static void app_pads(void)           /* a pad newly hit: the cursor to its row of the page (past the end: nothing) */
+/* a pad newly hit: the cursor to its row of the page (past the end: nothing); in instrument mode its instrument
+ * selected (one of another chip or a free slot: nothing) */
+static void app_pads(void)
 {
     uint32_t p, held = 0;
     for (p = 0; p < SMK_NPAD; p++)
         held |= (uint32_t)((fm1_in.pad_st[p] & 0x80u) != 0) << p;
-    for (p = 0; p < SMK_NPAD; p++)
-        if ((held & ~app.pads_held) >> p & 1u && app_page() + p < project_rows(app.track))
+    for (p = 0; p < SMK_NPAD; p++) {
+        if (!((held & ~app.pads_held) >> p & 1u))
+            continue;
+        if (app.pad_ins && app_ins_offered(p)) {
+            app.ins = (uint8_t)p;
+            app.last[PROJECT_F_INS] = (uint8_t)PROJECT_INS(p);
+        } else if (!app.pad_ins && app_page() + p < project_rows(app.track)) {
             app_cursor((int32_t)(app_page() + p));
+        }
+    }
     app.pads_held = (uint16_t)held;
 }
 
@@ -258,6 +292,8 @@ static void app_track(int32_t steps)  /* K3 turned: the next track up or down, s
     t = t < 0 ? 0 : t >= (int32_t)PLAYER_TRACKS ? (int32_t)PLAYER_TRACKS - 1 : t;
     if (t != app.track) {
         app.track = (uint8_t)t;
+        if (app.ins != VT_NO_INS && !app_ins_offered(app.ins))
+            app.ins = VT_NO_INS;
         app_cursor(app.cursor);
         app_redraw();
     }
@@ -280,6 +316,8 @@ static void app_input(void)          /* take every input event */
     }
     if (pressed >> SMK_BTN_SEQ_REC & 1u)
         app.rec ^= 1u;
+    if (pressed >> SMK_BTN_NOTE_REPEAT & 1u)
+        app.pad_ins ^= 1u;
     if (pressed >> SMK_BTN_LEFT & 1u)
         app_page_or_pattern(-1, shift);
     if (pressed >> SMK_BTN_RIGHT & 1u)
@@ -379,13 +417,14 @@ static void app_draw_line(uint32_t i, const vt_line_t *l)   /* screen line i */
 static uint32_t app_head_key(void)   /* what the header shows, as one word (never 0) */
 {
     return 1u | (uint32_t)app.track << 1 | (uint32_t)app.rec << 3 | project_bpm() << 4 |
-           project_rows(app.track) << 13 | project_pattern(app.track) << 20;
+           project_rows(app.track) << 13 | project_pattern(app.track) << 20 | (uint32_t)((app.ins + 1u) & 0x1Fu) << 26;
 }
 
 static void app_draw_head(void)
 {
     char s[12];
     uint32_t b = project_bpm(), n = 0;
+    int32_t x;
     cv_begin(240, VT_HEAD_H, VT_C_HEAD);
     s[0] = 'T';
     s[1] = (char)('1' + app.track);
@@ -398,7 +437,13 @@ static void app_draw_head(void)
     s[0] = (char)('0' + project_rows(app.track) / 10u);
     s[1] = (char)('0' + project_rows(app.track) % 10u);
     memcpy(s + 2, " ROWS", 6);
-    cv_text_r(232, 15, &AF_S, s, VT_C_HEAD_DIM, VT_C_HEAD);
+    x = cv_text_r(232, 15, &AF_S, s, VT_C_HEAD_DIM, VT_C_HEAD);
+    if (app.ins != VT_NO_INS) {          /* the selected instrument: INSxx NAME */
+        x = cv_text_r(x - 10, 15, &AF_S, project_ins_name(app.ins), VT_C_INS, VT_C_HEAD);
+        memcpy(s, "INS", 3);
+        app_hex(app.ins, 2, s + 3);
+        cv_text_r(x - 5, 15, &AF_S, s, VT_C_INS, VT_C_HEAD);
+    }
     if (b >= 100u)
         s[n++] = (char)('0' + b / 100u);
     s[n++] = (char)('0' + b / 10u % 10u);
@@ -440,12 +485,14 @@ static void app_draw(void)           /* the header if it changed, then each line
     }
 }
 
-static void app_leds(void)           /* the pads: the rows of the page; SEQ PLAY and SEQ REC */
+/* the pads: the rows of the page, or the instruments; SEQ PLAY, SEQ REC, NOTE REPEAT */
+static void app_leds(void)
 {
     uint32_t p, page = app_page(), playing = player_playing(), prow = player_row();
     for (p = 0; p < SMK_NPAD; p++) {
         uint32_t row = page + p;
-        const uint8_t *c = row >= project_rows(app.track) ? VT_PAD_PAST
+        const uint8_t *c = app.pad_ins ? (p == app.ins ? VT_PAD_INS_SEL : app_ins_offered(p) ? VT_PAD_INS : VT_PAD_PAST)
+                           : row >= project_rows(app.track) ? VT_PAD_PAST
                            : playing && row == prow   ? VT_PAD_PLAYING
                            : row == app.cursor      ? VT_PAD_CURSOR
                            : project_field(app.track, row, PROJECT_F_NOTE) ? VT_PAD_NOTE
@@ -454,6 +501,7 @@ static void app_leds(void)           /* the pads: the rows of the page; SEQ PLAY
     }
     fm1_led_key(SMK_BTN_SEQ_PLAY, playing);
     fm1_led_key(SMK_BTN_SEQ_REC, app.rec);
+    fm1_led_key(SMK_BTN_NOTE_REPEAT, app.pad_ins);
 }
 
 static void app_frame(void)

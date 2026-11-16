@@ -17,6 +17,15 @@
  *                                                 PROJECT_EFFECT_LETTERS
  *   project_set_field(track, row, f, v) writes it (anything else is refused: the row stays as it was)
  *   project_bpm(), project_set_bpm(b)   the tempo, one row a sixteenth; kept within PROJECT_BPM_MIN .. MAX
+ *   project_ins_chip(i)                 the chip instrument 0..15 belongs to (ADR 0002), PROJECT_CHIP_NONE: a free slot
+ *   project_ins_name(i)                 its name ("" for a free slot)
+ *   project_ins_new(i, chip, name)      slot i becomes an instrument of the chip, every sequence empty
+ *   project_seq(i, s)                   its sequence s (PROJECT_SEQ_*), read-only: len steps (0 = none, 64 at most),
+ *                                       v[0 .. len-1], loop and release a step or PROJECT_SEQ_NONE
+ *   project_set_seq(i, s, v, n, loop, release)  sets it (n kept to 64; a loop or release past the end: none)
+ * An NES instrument's sequences: volume 0..15, arpeggio (semitones added to the note), pitch (added to the period
+ * each frame: + lower), duty 0..3 (a pulse) or mode 0..1 (the noise). A new project has the factory instruments 00
+ * LEAD, 01 BASS, 02 KICK (the triangle), 03 SNARE and 04 HAT (the noise); 05 to 0F are free.
  * Each field is one byte (the effect: one half-word), so the player reads it whole while the app writes it. */
 #define PROJECT_TRACKS 4u
 #define PROJECT_ROWS 64u                 /* a pattern's room, its longest */
@@ -41,12 +50,34 @@
 #define PROJECT_F_INS 1u
 #define PROJECT_F_VOL 2u
 #define PROJECT_F_EFFECT 3u
+#define PROJECT_CHIP_NONE 0u             /* a free instrument slot */
+#define PROJECT_CHIP_NES 1u
+#define PROJECT_SEQ_VOL 0u               /* an instrument's sequences */
+#define PROJECT_SEQ_ARP 1u
+#define PROJECT_SEQ_PITCH 2u
+#define PROJECT_SEQ_DUTY 3u              /* duty (pulse) or mode (noise) */
+#define PROJECT_SEQS 4u
+#define PROJECT_SEQ_STEPS 64u
+#define PROJECT_SEQ_NONE 0xFFu           /* no loop / release point */
+#define PROJECT_NAME 8u                  /* an instrument's name: up to 7 characters */
+
+typedef struct {
+    uint8_t len, loop, release;
+    int8_t v[PROJECT_SEQ_STEPS];
+} project_seq_t;
+
+typedef struct {
+    uint8_t chip;
+    char name[PROJECT_NAME];
+    project_seq_t seq[PROJECT_SEQS];
+} project_ins_t;
 
 static struct {                          /* the patterns: 40 KiB, in the pool (gfx.c's cv_px is there too) */
     volatile uint8_t note[PROJECT_TRACKS][PROJECT_PATTERNS][PROJECT_ROWS],
         ins[PROJECT_TRACKS][PROJECT_PATTERNS][PROJECT_ROWS], vol[PROJECT_TRACKS][PROJECT_PATTERNS][PROJECT_ROWS];
     volatile uint16_t effect[PROJECT_TRACKS][PROJECT_PATTERNS][PROJECT_ROWS];
     volatile uint8_t rows[PROJECT_TRACKS][PROJECT_PATTERNS];   /* their lengths */
+    project_ins_t ins_def[PROJECT_INSTRUMENTS];                /* the instruments: 4.4 KiB */
 } project_pat __attribute__((section(".pool")));
 
 static struct {
@@ -54,9 +85,78 @@ static struct {
     volatile uint16_t bpm;
 } project;
 
+static uint32_t project_ins_chip(uint32_t i)
+{
+    return i < PROJECT_INSTRUMENTS ? project_pat.ins_def[i].chip : PROJECT_CHIP_NONE;
+}
+
+static const char *project_ins_name(uint32_t i) { return i < PROJECT_INSTRUMENTS ? project_pat.ins_def[i].name : ""; }
+
+static void project_ins_new(uint32_t i, uint32_t chip, const char *name)
+{
+    project_ins_t *d;
+    uint32_t s, k;
+    if (i >= PROJECT_INSTRUMENTS)
+        return;
+    d = &project_pat.ins_def[i];
+    d->chip = (uint8_t)chip;
+    for (k = 0; k + 1u < PROJECT_NAME && name[k]; k++)
+        d->name[k] = name[k];
+    for (; k < PROJECT_NAME; k++)
+        d->name[k] = 0;
+    for (s = 0; s < PROJECT_SEQS; s++)
+        d->seq[s].len = 0, d->seq[s].loop = d->seq[s].release = PROJECT_SEQ_NONE;
+}
+
+static const project_seq_t *project_seq(uint32_t i, uint32_t s)
+{
+    return &project_pat.ins_def[i < PROJECT_INSTRUMENTS ? i : 0u].seq[s < PROJECT_SEQS ? s : 0u];
+}
+
+static void project_set_seq(uint32_t i, uint32_t s, const int8_t *v, uint32_t n, uint32_t loop, uint32_t release)
+{
+    project_seq_t *q;
+    uint32_t k;
+    if (i >= PROJECT_INSTRUMENTS || s >= PROJECT_SEQS)
+        return;
+    q = &project_pat.ins_def[i].seq[s];
+    n = n > PROJECT_SEQ_STEPS ? PROJECT_SEQ_STEPS : n;
+    q->len = 0;                          /* (the player sees no steps while they change) */
+    for (k = 0; k < n; k++)
+        q->v[k] = v[k];
+    q->loop = (uint8_t)(loop < n ? loop : PROJECT_SEQ_NONE);
+    q->release = (uint8_t)(release < n ? release : PROJECT_SEQ_NONE);
+    q->len = (uint8_t)n;
+}
+
+/* the factory instruments: name; volume, arpeggio, pitch, duty sequences (n, loop, release, steps) */
+#define PROJECT_FACTORY 5u
+#define NO PROJECT_SEQ_NONE
+static const struct {
+    char name[PROJECT_NAME];
+    struct { uint8_t n, loop, release; int8_t v[16]; } seq[PROJECT_SEQS];
+} PROJECT_FACTORY_INS[PROJECT_FACTORY] = {
+    {"LEAD", {{13, NO, 7, {15, 14, 13, 12, 11, 10, 9, 8, 7, 5, 3, 1, 0}}, {0}, {0}, {3, NO, NO, {1, 1, 2}}}},
+    {"BASS", {{4, NO, 1, {15, 13, 6, 0}}, {0}, {0}, {1, NO, NO, {1}}}},
+    {"KICK", {{8, NO, NO, {15, 15, 14, 12, 10, 6, 3, 0}}, {0}, {8, NO, NO, {0, 32, 48, 64, 80, 96, 112, 120}},
+              {0}}},
+    {"SNARE", {{10, NO, NO, {15, 13, 11, 9, 7, 6, 4, 3, 1, 0}}, {0}, {0}, {1, NO, NO, {0}}}},
+    {"HAT", {{5, NO, NO, {10, 7, 4, 2, 0}}, {0}, {0}, {1, NO, NO, {0}}}},
+};
+
+#undef NO
+
 static void project_init(void)
 {
     uint32_t t, p, r;
+    for (t = 0; t < PROJECT_INSTRUMENTS; t++)
+        project_ins_new(t, PROJECT_CHIP_NONE, "");
+    for (t = 0; t < PROJECT_FACTORY; t++) {
+        project_ins_new(t, PROJECT_CHIP_NES, PROJECT_FACTORY_INS[t].name);
+        for (p = 0; p < PROJECT_SEQS; p++)
+            project_set_seq(t, p, PROJECT_FACTORY_INS[t].seq[p].v, PROJECT_FACTORY_INS[t].seq[p].n,
+                            PROJECT_FACTORY_INS[t].seq[p].loop, PROJECT_FACTORY_INS[t].seq[p].release);
+    }
     for (t = 0; t < PROJECT_TRACKS; t++) {
         for (p = 0; p < PROJECT_PATTERNS; p++) {
             for (r = 0; r < PROJECT_ROWS; r++) {
