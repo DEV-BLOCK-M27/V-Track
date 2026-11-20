@@ -2,10 +2,25 @@
  * V-Track: Copyright (C) 2026 Manuel Rubin */
 /* The project model: what a piece of music is, as operations on it. The app edits it, the player (in the audio ISR)
  * reads it:
- *   project_init()                      a new project: every pattern empty, PROJECT_ROWS_NEW rows, 120 BPM
- *   project_pattern(track)              the pattern track 0..3 plays and edits, 0 .. PROJECT_PATTERNS - 1 (the order
- *                                       list's place, #10); every call below means that pattern
- *   project_set_pattern(track, p)       selects it, kept within 0 .. PROJECT_PATTERNS - 1
+ *   project_init()                      a new project: every pattern empty, PROJECT_ROWS_NEW rows, 120 BPM; an order
+ *                                       list of one entry, P00 on each track
+ *   project_orders()                    the order list's entries, 1 .. PROJECT_ORDERS
+ *   project_order(e, track)             the pattern entry e names for track 0..3 (0 past the end)
+ *   project_set_order(e, track, p)      sets it, kept within 0 .. PROJECT_PATTERNS - 1
+ *   project_entry(), project_set_entry(e)   the current entry (the order list's cursor), kept within the entries;
+ *                                       the pattern calls below mean its patterns
+ *   project_order_add(e)                a new entry after e: each track's first pattern no entry names (none left:
+ *                                       e's); 1 if done, 0 if the list is full (PROJECT_ORDERS)
+ *   project_order_dup(e)                a copy of e after it; 1 / 0 as above
+ *   project_order_delete(e)             e taken out (not the last one left: 0); the entries after it a place up, the
+ *                                       current entry stays on its entry (it, deleted: the one after, or before at
+ *                                       the end)
+ *   project_order_move(e, dir)          e moved dir places (+ down), within the list; the entries between move the
+ *                                       other way. Its new place
+ *   project_rows_of(track, p), project_field_of(track, p, row, f)   pattern p's length, a field of it (as below)
+ *   project_pattern(track)              the pattern track 0..3 edits: the current entry's, 0 .. PROJECT_PATTERNS - 1;
+ *                                       every call below means that pattern
+ *   project_set_pattern(track, p)       the current entry names p for the track, kept within 0 .. PROJECT_PATTERNS - 1
  *   project_rows(track)                 the length of track 0..3's pattern in rows
  *   project_set_rows(track, n)          sets it, kept within PROJECT_ROWS_MIN .. PROJECT_ROWS (rows past it keep
  *                                       what they hold, for when it grows again)
@@ -35,11 +50,14 @@
  * An NES instrument's sequences: volume 0..15, arpeggio (semitones added to the note), pitch (added to the period
  * each frame: + lower), duty 0..3 (a pulse) or mode 0..1 (the noise). A new project has the factory instruments 00
  * LEAD, 01 BASS, 02 KICK (the triangle), 03 SNARE and 04 HAT (the noise); 05 to 0F are free.
- * Each field is one byte (the effect: one half-word), so the player reads it whole while the app writes it. */
+ * Each field is one byte (the effect: one half-word), so the player reads it whole while the app writes it. An
+ * entry's patterns are a byte each too: a row starting while the order list changes may take some of its tracks'
+ * patterns from the entry before the change and some from after it (that row only). */
 #define PROJECT_TRACKS 4u
 #define PROJECT_ROWS 64u                 /* a pattern's room, its longest */
 #define PROJECT_ROWS_MIN 16u
 #define PROJECT_PATTERNS 32u             /* a track's patterns */
+#define PROJECT_ORDERS 64u               /* the order list's entries, at most */
 #define PROJECT_ROWS_NEW 16u             /* a new pattern's length: one page, all of it on the pads */
 #define PROJECT_BPM_MIN 30u
 #define PROJECT_BPM_MAX 300u
@@ -97,7 +115,9 @@ static struct {                          /* the patterns: 40 KiB, in the pool (g
 } project_pat __attribute__((section(".pool")));
 
 static struct {
-    volatile uint8_t pattern[PROJECT_TRACKS];   /* the pattern each track plays */
+    volatile uint8_t order[PROJECT_ORDERS][PROJECT_TRACKS];   /* the order list: each entry's pattern a track */
+    volatile uint8_t orders;             /* its entries, 1 .. PROJECT_ORDERS */
+    volatile uint8_t entry;              /* the current entry, 0 .. orders - 1 */
     volatile uint16_t bpm;
 } project;
 
@@ -251,45 +271,151 @@ static void project_init(void)
             }
             project_pat.rows[t][p] = PROJECT_ROWS_NEW;
         }
-        project.pattern[t] = 0;
+        project.order[0][t] = 0;
     }
+    project.orders = 1;
+    project.entry = 0;
     project.bpm = 120;
 }
 
-static uint32_t project_pattern(uint32_t track) { return track < PROJECT_TRACKS ? project.pattern[track] : 0u; }
-
-static void project_set_pattern(uint32_t track, int32_t p)
+static uint32_t project_clamp(int32_t v, uint32_t n)   /* v within 0 .. n - 1 */
 {
-    if (track < PROJECT_TRACKS)
-        project.pattern[track] = (uint8_t)(p < 0                            ? 0u
-                                           : p >= (int32_t)PROJECT_PATTERNS ? PROJECT_PATTERNS - 1u
-                                                                            : (uint32_t)p);
+    return v < 0 ? 0u : v >= (int32_t)n ? n - 1u : (uint32_t)v;
 }
 
-static uint32_t project_rows(uint32_t track)
+/* --- the order list --- */
+
+static uint32_t project_orders(void) { return project.orders; }
+static uint32_t project_entry(void) { return project.entry; }
+static void project_set_entry(int32_t e) { project.entry = (uint8_t)project_clamp(e, project.orders); }
+
+static uint32_t project_order(uint32_t e, uint32_t track)
 {
-    return track < PROJECT_TRACKS ? project_pat.rows[track][project.pattern[track]] : 0u;
+    return e < project.orders && track < PROJECT_TRACKS ? project.order[e][track] : 0u;
 }
+
+static void project_set_order(uint32_t e, uint32_t track, int32_t p)
+{
+    if (e < project.orders && track < PROJECT_TRACKS)
+        project.order[e][track] = (uint8_t)project_clamp(p, PROJECT_PATTERNS);
+}
+
+static int project_order_insert(uint32_t e, const uint8_t *pat)   /* pat[] as a new entry after e */
+{
+    uint32_t k, t, n = project.orders;
+    if (e >= n || n >= PROJECT_ORDERS)
+        return 0;
+    for (k = n; k > e + 1u; k--)        /* the entries after it a place on, the last first */
+        for (t = 0; t < PROJECT_TRACKS; t++)
+            project.order[k][t] = project.order[k - 1u][t];
+    for (t = 0; t < PROJECT_TRACKS; t++)
+        project.order[e + 1u][t] = pat[t];
+    PROJECT_ORDER();
+    project.orders = (uint8_t)(n + 1u);
+    return 1;
+}
+
+static int project_order_add(uint32_t e)
+{
+    uint8_t pat[PROJECT_TRACKS];
+    uint32_t t, p, k;
+    if (e >= project.orders)
+        return 0;
+    for (t = 0; t < PROJECT_TRACKS; t++) {   /* each track's first pattern no entry names */
+        pat[t] = project.order[e][t];
+        for (p = 0; p < PROJECT_PATTERNS; p++) {
+            for (k = 0; k < project.orders && project.order[k][t] != p; k++)
+                ;
+            if (k == project.orders) {
+                pat[t] = (uint8_t)p;
+                break;
+            }
+        }
+    }
+    return project_order_insert(e, pat);
+}
+
+static int project_order_dup(uint32_t e)
+{
+    uint8_t pat[PROJECT_TRACKS];
+    uint32_t t;
+    if (e >= project.orders)
+        return 0;
+    for (t = 0; t < PROJECT_TRACKS; t++)
+        pat[t] = project.order[e][t];
+    return project_order_insert(e, pat);
+}
+
+static int project_order_delete(uint32_t e)
+{
+    uint32_t k, t, n = project.orders;
+    if (e >= n || n < 2u)
+        return 0;
+    if (project.entry > e || project.entry >= n - 1u)   /* (first: it stays within the entries) */
+        project.entry = (uint8_t)(project.entry - 1u);
+    PROJECT_ORDER();
+    project.orders = (uint8_t)(n - 1u);   /* (then: the player never reads past the end) */
+    PROJECT_ORDER();
+    for (k = e; k + 1u < n; k++)
+        for (t = 0; t < PROJECT_TRACKS; t++)
+            project.order[k][t] = project.order[k + 1u][t];
+    return 1;
+}
+
+static uint32_t project_order_move(uint32_t e, int32_t dir)
+{
+    uint32_t to, t;
+    if (e >= project.orders)
+        return e;
+    to = project_clamp((int32_t)e + dir, project.orders);
+    while (e != to) {                    /* a place at a time: the entries between move the other way */
+        uint32_t k = to > e ? e + 1u : e - 1u;
+        for (t = 0; t < PROJECT_TRACKS; t++) {
+            uint8_t p = project.order[e][t];
+            project.order[e][t] = project.order[k][t];
+            project.order[k][t] = p;
+        }
+        e = k;
+    }
+    return to;
+}
+
+/* --- the patterns --- */
+
+static uint32_t project_pattern(uint32_t track) { return project_order(project.entry, track); }
+
+static void project_set_pattern(uint32_t track, int32_t p) { project_set_order(project.entry, track, p); }
+
+static uint32_t project_rows_of(uint32_t track, uint32_t p)
+{
+    return track < PROJECT_TRACKS && p < PROJECT_PATTERNS ? project_pat.rows[track][p] : 0u;
+}
+
+static uint32_t project_rows(uint32_t track) { return project_rows_of(track, project_pattern(track)); }
 
 static void project_set_rows(uint32_t track, int32_t n)
 {
     if (track < PROJECT_TRACKS)
-        project_pat.rows[track][project.pattern[track]] =
+        project_pat.rows[track][project_pattern(track)] =
             (uint8_t)(n < (int32_t)PROJECT_ROWS_MIN ? PROJECT_ROWS_MIN
                       : n > (int32_t)PROJECT_ROWS   ? PROJECT_ROWS
                                                     : (uint32_t)n);
 }
 
+static uint32_t project_field_of(uint32_t track, uint32_t p, uint32_t row, uint32_t f)
+{
+    if (row >= project_rows_of(track, p))
+        return PROJECT_EMPTY;
+    return f == PROJECT_F_NOTE     ? project_pat.note[track][p][row]
+           : f == PROJECT_F_INS    ? project_pat.ins[track][p][row]
+           : f == PROJECT_F_VOL    ? project_pat.vol[track][p][row]
+           : f == PROJECT_F_EFFECT ? project_pat.effect[track][p][row]
+                                   : PROJECT_EMPTY;
+}
+
 static uint32_t project_field(uint32_t track, uint32_t row, uint32_t f)
 {
-    if (row >= project_rows(track))
-        return PROJECT_EMPTY;
-    uint32_t p = project.pattern[track];
-    return f == PROJECT_F_NOTE ? project_pat.note[track][p][row]
-           : f == PROJECT_F_INS ? project_pat.ins[track][p][row]
-           : f == PROJECT_F_VOL ? project_pat.vol[track][p][row]
-           : f == PROJECT_F_EFFECT  ? project_pat.effect[track][p][row]
-                                : PROJECT_EMPTY;
+    return project_field_of(track, project_pattern(track), row, f);
 }
 
 static int project_effect_ok(uint32_t v)     /* an effect: a letter of PROJECT_EFFECT_LETTERS, a parameter */
@@ -306,7 +432,7 @@ static void project_set_field(uint32_t track, uint32_t row, uint32_t f, uint32_t
     uint32_t p;
     if (row >= project_rows(track))
         return;
-    p = project.pattern[track];
+    p = project_pattern(track);
     if (f == PROJECT_F_NOTE && (v == PROJECT_EMPTY || PROJECT_IS_NOTE(v) || v == PROJECT_CUT || v == PROJECT_RELEASE))
         project_pat.note[track][p][row] = (uint8_t)v;
     if (f == PROJECT_F_INS && v <= PROJECT_INS(PROJECT_INSTRUMENTS - 1u))

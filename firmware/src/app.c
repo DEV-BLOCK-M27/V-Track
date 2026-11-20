@@ -7,7 +7,7 @@
  *   app_frame()         each main-loop frame (~60 a second): input in, LEDs and display out
  *   app_idle()          between frames, as often as the main loop gets round to it
  *   app_audio(out, n)   in the audio ISR: n stereo frames, Q15, interleaved L R
- * Two views. The pattern view (docs/design/pattern-view.png): a header (the track, its chip and channel, its
+ * Three views. The pattern view (docs/design/pattern-view.png): a header (the track, its chip and channel, its
  * pattern Pxx; the tempo, REC, the pattern's length) over 13 rows of the selected track's pattern, all four columns
  * (note, instrument, volume, effect), and the other three tracks' note columns right of a separator. The cursor row
  * has a blue bar, the playing row a red one (both: purple). The screen follows the cursor, scrolling as little as
@@ -20,7 +20,10 @@
  * < and > turn the page (16 rows; the cursor moves with it, the last page may be shorter), shift + < and > select
  * the track's pattern (P00 to P1F). The keys play the selected track (player.c), one note at a time a track: the
  * last key pressed takes the channel, its release silences it; a held note stays on its track.
- * SEQ PLAY starts and stops the patterns (looped, all four tracks), SEQ REC switches recording (both LEDs show it).
+ * The pattern view shows the current entry's patterns (the order list's cursor); the playing row only while that
+ * entry plays. SEQ PLAY starts and stops the order list from the current entry (player.c: it loops at its end),
+ * shift + SEQ PLAY switches the pattern-loop mode (the current entry over and over; LOOP in the header), SEQ REC
+ * switches recording (both LEDs show it).
  * With REC on and the sequencer stopped a key also writes its note into the cursor row, and shift with a white key
  * a cut, with a black key a release (shift keeps the keys from playing); the cursor then moves down a row (after
  * the last row, to the first). The pads show the 16 rows of the cursor's page: empty, a note (cut and release too),
@@ -43,7 +46,17 @@
  * shift + K4 moves that cursor (7 characters). All of them stop at their ends. The pads are the instruments as in
  * instrument mode; a tap edits that one, shift + a free slot's pad copies the edited instrument there and edits the
  * copy. The keys play the edited instrument on the selected track (step entry is off), so a held note plays each
- * edited step it reaches (one it has played to the end of no more: the player's rules, player.c). Every other input (USB MIDI in too) is taken and dropped. */
+ * edited step it reaches (one it has played to the end of no more: the player's rules, player.c).
+ * ARP opens the order list, SEQ goes back to the pattern view; ARP's LED is lit there. A header (ORDER, the tempo,
+ * SONG or LOOP; the tracks' columns T1 to T4, the selected one brighter) over 13 entries: the entry's number and
+ * the pattern it names for each track. The cursor's entry (the current one) has a blue bar, the playing one a red
+ * one (both: purple); the screen follows the cursor. K2 moves the cursor, shift + K2 moves the cursor's entry with
+ * it; K5 to K8 set its pattern on tracks 1 to 4 (P00 to P1F); K3 and K4 select the track and set the tempo as in
+ * the pattern view. > adds an entry after the cursor's (new patterns: each track's first one no entry names), shift
+ * + > a copy of it, the cursor to it; shift + < deletes the cursor's entry (not the last one; < alone: nothing). The
+ * pads show the 16 entries of the cursor's page (an entry, the cursor, the playing one, dark past the end); a tap
+ * moves the cursor there. The keys play the selected track (step entry is off).
+ * Every other input (USB MIDI in too) is taken and dropped. */
 #define VT_NAME "V-Track"
 #define VT_KEY_NOTE0 48u         /* keybed key 0 = C3 (MIDI 48) */
 #define VT_ENC_TRACK 2u          /* K3: track select */
@@ -87,6 +100,9 @@
 #define VT_NO_INS PLAYER_NO_INS  /* no instrument selected */
 #define VT_VIEW_PATTERN 0u       /* app.view */
 #define VT_VIEW_EDITOR 1u
+#define VT_VIEW_ORDER 2u
+#define VT_O_X 64                /* the order list: each track's pattern column, VT_O_W apart */
+#define VT_O_W 44
 #define VT_ENC_STEP 1u           /* the editor: K2 step, K3 sequence, K4 name, K5 value, K6 length, K7 loop, */
 #define VT_ENC_SEQ 2u            /* K8 release */
 #define VT_ENC_NAME 3u
@@ -114,6 +130,10 @@ typedef struct {                 /* what a sequence's panel shows: drawn again w
     uint8_t ins, sel, step, mode;
 } vt_panel_t;
 
+typedef struct {                 /* what an order list line shows: drawn again when it changes */
+    uint8_t entry, mark, track, pat[PROJECT_TRACKS];
+} vt_oline_t;
+
 typedef struct {                 /* what a screen line shows: drawn again when it changes */
     uint8_t row, mark, note[PROJECT_TRACKS], ins, vol;
     uint16_t effect;
@@ -136,6 +156,8 @@ static struct {
     uint8_t view;                /* VT_VIEW_* */
     uint8_t seq, step, name_pos; /* the editor: its sequence, step, the name's cursor */
     vt_panel_t panel[PROJECT_SEQS];   /* what each sequence's panel shows */
+    uint8_t otop;                /* the order list: the first entry on the screen */
+    vt_oline_t oshown[VT_SHOWN]; /* what each of its lines shows */
 } app;
 
 static const uint8_t VT_PAD_EMPTY[3] = {2, 2, 6}, VT_PAD_NOTE[3] = {0, 20, 60}, VT_PAD_CURSOR[3] = {60, 60, 60},
@@ -162,6 +184,7 @@ static void app_redraw(void)         /* the header and every line again */
     app.head = 0;
     memset(app.shown, 0xFF, sizeof app.shown);   /* (no line shows row 0xFF) */
     memset(app.panel, 0xFF, sizeof app.panel);   /* (no panel shows instrument 0xFF) */
+    memset(app.oshown, 0xFF, sizeof app.oshown); /* (no line shows entry 0xFF) */
 }
 
 static void app_start(void)
@@ -183,6 +206,7 @@ static void app_start(void)
     app.keys = fm1_in.keys;              /* keys held already: no note until pressed again */
     app.view = VT_VIEW_PATTERN;
     app.seq = app.step = app.name_pos = 0;
+    app.otop = 0;
     lcd_fill(0, 0, 240, 240, VT_C_BG);
 }
 
@@ -213,6 +237,21 @@ static void app_follow(void)         /* the cursor moved: the screen scrolls as 
 }
 
 static int32_t app_clamp(int32_t v, int32_t lo, int32_t hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+static int app_entry_playing(void)   /* the current entry plays (the pattern view's rows) */
+{
+    return player_playing() && player_entry() == project_entry();
+}
+
+static void app_bpm_text(char *s)    /* the project's tempo: "120 BPM" */
+{
+    uint32_t b = project_bpm(), n = 0;
+    if (b >= 100u)
+        s[n++] = (char)('0' + b / 100u);
+    s[n++] = (char)('0' + b / 10u % 10u);
+    s[n++] = (char)('0' + b % 10u);
+    memcpy(s + n, " BPM", 5);
+}
 
 static void app_cursor(int32_t r)    /* the cursor to row r, within the pattern; the screen follows */
 {
@@ -322,7 +361,7 @@ static void app_keys(void)           /* the keybed: releases, then the highest k
 /* --- the instrument editor (PATCH) --- */
 
 static void app_view(uint32_t v)     /* PATCH: the editor for the selected instrument (none: the chip's first); SEQ:
-                                      * the pattern view */
+                                      * the pattern view; ARP: the order list */
 {
     uint32_t i;
     if (v == VT_VIEW_EDITOR && app.ins == VT_NO_INS)
@@ -333,6 +372,8 @@ static void app_view(uint32_t v)     /* PATCH: the editor for the selected instr
         return;                          /* (no instrument of the chip at all) */
     if (v == VT_VIEW_EDITOR)
         app.last[PROJECT_F_INS] = (uint8_t)PROJECT_INS(app.ins);
+    if (v == VT_VIEW_PATTERN)
+        app_cursor(app.cursor);          /* (the entry's patterns may be shorter) */
     if (v != app.view) {
         app.view = (uint8_t)v;
         app_redraw();
@@ -392,8 +433,43 @@ static void app_editor_pad(uint32_t p, uint32_t shift)
     }
 }
 
+/* --- the order list (ARP) --- */
+
+static uint32_t app_opage(void) { return project_entry() / VT_PAGE * VT_PAGE; }   /* the entry's page */
+
+static void app_entry(int32_t e)     /* the order list's cursor (the current entry) to e; the screen follows */
+{
+    project_set_entry(e);
+    e = (int32_t)project_entry();
+    if (e < app.otop)
+        app.otop = (uint8_t)e;
+    if (e >= app.otop + (int32_t)VT_SHOWN)
+        app.otop = (uint8_t)(e + 1 - (int32_t)VT_SHOWN);
+}
+
+/* > : a new entry after the cursor's (each track's first pattern no entry names), shift + > : a copy of it; the
+ * cursor to it. shift + < : the cursor's entry deleted (not the last one left) */
+static void app_order_button(int32_t dir, uint32_t shift)
+{
+    uint32_t e = project_entry();
+    if (dir > 0 && (shift ? project_order_dup(e) : project_order_add(e)))
+        app_entry((int32_t)e + 1);
+    if (dir < 0 && shift && project_order_delete(e))
+        app_entry((int32_t)project_entry());
+}
+
+static void app_order_edit(uint32_t enc, int32_t steps, uint32_t shift)   /* an encoder turned in the order list */
+{
+    uint32_t e = project_entry();
+    if (enc == VT_ENC_CURSOR)            /* K2: the cursor; shift: the entry moves with it */
+        app_entry(shift ? (int32_t)project_order_move(e, steps) : (int32_t)e + steps);
+    if (enc >= VT_ENC_NOTE && enc < VT_ENC_NOTE + PROJECT_TRACKS)   /* K5 to K8: track 1 to 4's pattern */
+        project_set_order(e, enc - VT_ENC_NOTE, (int32_t)project_order(e, enc - VT_ENC_NOTE) + steps);
+}
+
 /* a pad newly hit: the cursor to its row of the page (past the end: nothing); in instrument mode its instrument
- * selected (one of another chip or a free slot: nothing) */
+ * selected (one of another chip or a free slot: nothing); in the editor that instrument edited; in the order list
+ * the cursor to its entry of the page (past the end: nothing) */
 static void app_pads(void)
 {
     uint32_t p, held = 0, shift = fm1_in.buttons >> SMK_BTN_KNOB_BANK & 1u;
@@ -404,6 +480,9 @@ static void app_pads(void)
             continue;
         if (app.view == VT_VIEW_EDITOR) {
             app_editor_pad(p, shift);
+        } else if (app.view == VT_VIEW_ORDER) {
+            if (app_opage() + p < project_orders())
+                app_entry((int32_t)(app_opage() + p));
         } else if (app.pad_ins && app_ins_offered(p)) {
             app.ins = (uint8_t)p;
             app.last[PROJECT_F_INS] = (uint8_t)PROJECT_INS(p);
@@ -436,7 +515,9 @@ static void app_input(void)          /* take every input event */
     }
     midi_in_overflow = 0;
     pressed = fm1_input_edges(0);
-    if (pressed >> SMK_BTN_SEQ_PLAY & 1u) {
+    if (pressed >> SMK_BTN_SEQ_PLAY & 1u && shift) {   /* shift + SEQ PLAY: the pattern-loop mode */
+        player_set_loop(!player_loop());
+    } else if (pressed >> SMK_BTN_SEQ_PLAY & 1u) {
         if (player_playing())
             player_stop();
         else
@@ -450,6 +531,12 @@ static void app_input(void)          /* take every input event */
         app_view(VT_VIEW_EDITOR);
     if (pressed >> SMK_BTN_SEQ & 1u)
         app_view(VT_VIEW_PATTERN);
+    if (pressed >> SMK_BTN_ARP & 1u)
+        app_view(VT_VIEW_ORDER);
+    if (app.view == VT_VIEW_ORDER && pressed >> SMK_BTN_LEFT & 1u)
+        app_order_button(-1, shift);
+    if (app.view == VT_VIEW_ORDER && pressed >> SMK_BTN_RIGHT & 1u)
+        app_order_button(1, shift);
     if (app.view == VT_VIEW_PATTERN && pressed >> SMK_BTN_LEFT & 1u)
         app_page_or_pattern(-1, shift);
     if (app.view == VT_VIEW_PATTERN && pressed >> SMK_BTN_RIGHT & 1u)
@@ -463,6 +550,14 @@ static void app_input(void)          /* take every input event */
             continue;
         if (app.view == VT_VIEW_EDITOR) {
             app_editor_edit(e, s, shift);
+            continue;
+        }
+        if (app.view == VT_VIEW_ORDER) {
+            app_order_edit(e, s, shift);
+            if (e == VT_ENC_TRACK)
+                app_track(s);
+            if (e == VT_ENC_TEMPO)
+                project_set_bpm((int32_t)project_bpm() + s);
             continue;
         }
         if (e == VT_ENC_CURSOR && shift) {   /* shift + K2: the pattern's length */
@@ -553,13 +648,14 @@ static void app_draw_line(uint32_t i, const vt_line_t *l)   /* screen line i */
 static uint32_t app_head_key(void)   /* what the header shows, as one word (never 0) */
 {
     return 1u | (uint32_t)app.track << 1 | (uint32_t)app.rec << 3 | project_bpm() << 4 |
-           project_rows(app.track) << 13 | project_pattern(app.track) << 20 | (uint32_t)((app.ins + 1u) & 0x1Fu) << 26;
+           project_rows(app.track) << 13 | project_pattern(app.track) << 20 | (uint32_t)player_loop() << 25 |
+           (uint32_t)((app.ins + 1u) & 0x1Fu) << 26;
 }
 
 static void app_draw_head(void)
 {
     char s[12];
-    uint32_t b = project_bpm(), n = 0;
+    uint32_t n;
     int32_t x;
     cv_begin(240, VT_HEAD_H, VT_C_HEAD);
     s[0] = 'T';
@@ -580,20 +676,18 @@ static void app_draw_head(void)
         app_hex(app.ins, 2, s + 3);
         cv_text_r(x - 5, 15, &AF_S, s, VT_C_INS, VT_C_HEAD);
     }
-    if (b >= 100u)
-        s[n++] = (char)('0' + b / 100u);
-    s[n++] = (char)('0' + b / 10u % 10u);
-    s[n++] = (char)('0' + b % 10u);
-    memcpy(s + n, " BPM", 5);
+    app_bpm_text(s);
     n = (uint32_t)cv_text(8, 15, &AF_S, s, VT_C_HEAD_DIM);
     if (app.rec)
-        cv_text((int32_t)n + 12, 15, &AF_S, "REC", VT_C_HEAD_DIM);
+        n = (uint32_t)cv_text((int32_t)n + 12, 15, &AF_S, "REC", VT_C_HEAD_DIM);
+    if (player_loop())
+        cv_text((int32_t)n + 12, 15, &AF_S, "LOOP", VT_C_HEAD_DIM);
     cv_blit(0, 0);
 }
 
 static void app_draw(void)           /* the header if it changed, then each line that changed */
 {
-    uint32_t i, t, playing = player_playing(), prow = player_row(), rows = project_rows(app.track);
+    uint32_t i, t, playing = app_entry_playing(), prow = player_row(), rows = project_rows(app.track);
     if (app.head != app_head_key()) {
         app_draw_head();
         app.head = app_head_key();
@@ -752,13 +846,93 @@ static void app_editor_draw(void)     /* the editor: the header if it changed, t
     }
 }
 
-/* the pads: the rows of the page, or the instruments; SEQ PLAY, SEQ REC, NOTE REPEAT */
+static uint32_t app_order_head_key(void)   /* what the order list's header shows, as one word (never 0) */
+{
+    return 1u | (uint32_t)app.track << 1 | (uint32_t)player_loop() << 3 | project_bpm() << 4;
+}
+
+static void app_order_head(void)     /* ORDER, the tempo, SONG or LOOP; the tracks' columns T1 .. T4 */
+{
+    char s[12];
+    uint32_t t;
+    int32_t x;
+    cv_begin(240, VT_HEAD_H, VT_C_HEAD);
+    x = cv_text(8, 1, &AF_S, "ORDER", VT_C_TEXT);
+    app_bpm_text(s);
+    cv_text(x + 12, 1, &AF_S, s, VT_C_HEAD_DIM);
+    cv_text_r(232, 1, &AF_S, player_loop() ? "LOOP" : "SONG", VT_C_TEXT, VT_C_HEAD);
+    for (t = 0; t < PROJECT_TRACKS; t++) {
+        s[0] = 'T';
+        s[1] = (char)('1' + t);
+        s[2] = 0;
+        cv_text(VT_O_X + (int32_t)t * VT_O_W, 15, &AF_S, s, t == app.track ? VT_C_TEXT : VT_C_HEAD_DIM);
+    }
+    cv_blit(0, 0);
+}
+
+static void app_order_line(uint32_t i, const vt_oline_t *l)   /* order list line i: the entry, its patterns */
+{
+    static const uint16_t BG[4] = {VT_C_BG, VT_C_CURSOR, VT_C_PLAYING, VT_C_CURSOR_PLAYING};
+    uint16_t bg = BG[l->mark & (VT_LINE_CURSOR | VT_LINE_PLAYING)];
+    uint32_t t;
+    char s[3];
+    cv_begin(240, VT_ROW_H, bg);
+    if (!(l->mark & VT_LINE_PAST)) {
+        app_hex(l->entry, 2, s);
+        cv_text_mono(VT_X_NUM, 0, &AF_S, s, VT_C_NUM_BEAT, bg, VT_PITCH);
+        for (t = 0; t < PROJECT_TRACKS; t++) {
+            app_hex(l->pat[t], 2, s);
+            cv_text_mono(VT_O_X + (int32_t)t * VT_O_W, 0, &AF_S, s, t == l->track ? VT_C_TEXT : VT_C_OTHER, bg,
+                         VT_PITCH);
+        }
+    }
+    cv_blit(0, VT_HEAD_H + i * VT_ROW_H);
+}
+
+static void app_order_draw(void)     /* the order list: the header if it changed, then each line that changed */
+{
+    uint32_t i, t, playing = player_playing(), pe = player_entry();
+    if (app.otop + VT_SHOWN > project_orders())   /* (entries deleted: the screen keeps as many shown as can be) */
+        app.otop = (uint8_t)(project_orders() > VT_SHOWN ? project_orders() - VT_SHOWN : 0u);
+    if (project_entry() < app.otop)
+        app.otop = (uint8_t)project_entry();
+    if (app.head != app_order_head_key()) {
+        app_order_head();
+        app.head = app_order_head_key();
+    }
+    for (i = 0; i < VT_SHOWN; i++) {
+        vt_oline_t l;
+        uint32_t e = app.otop + i;
+        memset(&l, 0, sizeof l);
+        l.entry = (uint8_t)e;
+        l.track = app.track;
+        if (e >= project_orders()) {
+            l.mark = VT_LINE_PAST;
+        } else {
+            for (t = 0; t < PROJECT_TRACKS; t++)
+                l.pat[t] = (uint8_t)project_order(e, t);
+            l.mark = (uint8_t)((e == project_entry() ? VT_LINE_CURSOR : 0u) |
+                               (playing && e == pe ? VT_LINE_PLAYING : 0u));
+        }
+        if (memcmp(&l, &app.oshown[i], sizeof l)) {
+            app_order_line(i, &l);
+            app.oshown[i] = l;
+        }
+    }
+}
+
+/* the pads: the rows of the page, the instruments, or the order list's entries; SEQ PLAY, SEQ REC, NOTE REPEAT */
 static void app_leds(void)
 {
-    uint32_t p, page = app_page(), playing = player_playing(), prow = player_row();
+    uint32_t p, page = app_page(), playing = app_entry_playing(), prow = player_row(), opage = app_opage();
     for (p = 0; p < SMK_NPAD; p++) {
-        uint32_t row = page + p;
-        const uint8_t *c = app.pad_ins || app.view == VT_VIEW_EDITOR
+        uint32_t row = page + p, e = opage + p;
+        const uint8_t *c = app.view == VT_VIEW_ORDER
+                               ? (e >= project_orders()                          ? VT_PAD_PAST
+                                  : player_playing() && e == player_entry() ? VT_PAD_PLAYING
+                                  : e == project_entry()                         ? VT_PAD_CURSOR
+                                                                                 : VT_PAD_NOTE)
+                           : app.pad_ins || app.view == VT_VIEW_EDITOR
                                ? (p == app.ins ? VT_PAD_INS_SEL : app_ins_offered(p) ? VT_PAD_INS : VT_PAD_PAST)
                            : row >= project_rows(app.track) ? VT_PAD_PAST
                            : playing && row == prow   ? VT_PAD_PLAYING
@@ -771,6 +945,7 @@ static void app_leds(void)
     fm1_led_key(SMK_BTN_SEQ_REC, app.rec);
     fm1_led_key(SMK_BTN_NOTE_REPEAT, app.pad_ins);
     fm1_led_key(SMK_BTN_PATCH, app.view == VT_VIEW_EDITOR);
+    fm1_led_key(SMK_BTN_ARP, app.view == VT_VIEW_ORDER);
 }
 
 static void app_frame(void)
@@ -778,6 +953,8 @@ static void app_frame(void)
     app_input();
     if (app.view == VT_VIEW_EDITOR)
         app_editor_draw();
+    else if (app.view == VT_VIEW_ORDER)
+        app_order_draw();
     else
         app_draw();
     app_leds();

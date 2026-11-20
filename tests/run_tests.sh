@@ -25,6 +25,9 @@
 #                   tests/vt_effect_test.c: the effect column at the NES frame rate (0xy arpeggio, 1xx / 2xx slides,
 #                   3xx portamento, 4xy vibrato, Axy volume slide, Vxx duty or mode, Gxx delay, Sxx cut), 00 stopping
 #                   them, with the instruments' sequences.
+#                   tests/vt_order_test.c: the order list (ARP: entries added, duplicated, deleted, moved), song
+#                   playback from the current entry looping at the end, the pattern-loop mode, Fxx Bxx Dxx, the
+#                   playing entry shown; the screen in build/host/order.ppm.
 # NES chip core (seam B, tests/nes_test.c): register states in, samples out: duty waveforms, period -> frequency,
 #                   the triangle's staircase, the noise's periods and LFSR modes, the 2A03 mixer, no aliasing on
 #                   high notes.
@@ -139,6 +142,9 @@ run "DEVICE: the instrument editor (PATCH): bar graphs, steps, length, loop, rel
 $CC $VT -o "$OUT/vt_effect_test" tests/vt_effect_test.c -lm
 run "DEVICE: effects 0xy 1xx 2xx 3xx 4xy Axy Vxx Gxx Sxx a NES frame at a time, 00 stopping, with instruments" \
     "$OUT/vt_effect_test"
+$CC $VT -o "$OUT/vt_order_test" tests/vt_order_test.c -lm
+run "DEVICE: the order list (add, duplicate, delete, move), song playback, pattern loop, Fxx Bxx Dxx, playing entry" \
+    "$OUT/vt_order_test" "$OUT"
 
 # seam B: the NES chip core alone
 $CC -o "$OUT/nes_test" tests/nes_test.c -lm
@@ -197,6 +203,8 @@ else
     run "ASan/UBSan: DEVICE, the instrument editor" "$A/vt_editor_test"
     $SCC $VT -o "$A/vt_effect_test" tests/vt_effect_test.c -lm
     run "ASan/UBSan: DEVICE, effects" "$A/vt_effect_test"
+    $SCC $VT -o "$A/vt_order_test" tests/vt_order_test.c -lm
+    run "ASan/UBSan: DEVICE, the order list and song playback" "$A/vt_order_test"
     $SCC -o "$A/nes_test" tests/nes_test.c -lm
     run "ASan/UBSan: NES chip core" "$A/nes_test"
 fi

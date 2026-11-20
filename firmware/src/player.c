@@ -5,16 +5,25 @@
  *   player_note_on(track, note, ins) a live note (MIDI number) on track 0..3 with instrument ins (0..15, or
  *                                    PLAYER_NO_INS): it takes the track's channel over
  *   player_note_off(track, note)     its key up: silent, if it is the note the track plays
- *   player_play() / player_stop()    the sequencer: looped playback of the patterns (project.c) from their first
- *                                    row / silence; it takes effect at the next audio block. The loop is as long
- *                                    as the longest of the four; a shorter one is silent (empty rows) past its end
- *   player_playing(), player_row()   whether it plays, and the row playing
+ *   player_play() / player_stop()    the sequencer: the order list (project.c) from the current entry's first row
+ *                                    / silence; it takes effect at the next audio block. An entry lasts as long as
+ *                                    the longest of its four patterns; a shorter one is silent (empty rows) past
+ *                                    its end. After an entry the next, after the last the first
+ *   player_set_loop(on), player_loop()   the pattern-loop mode: after an entry the current entry (project_entry(),
+ *                                    the order list's cursor) again, so it loops, and a new cursor takes over at
+ *                                    the entry's end
+ *   player_playing(), player_entry(), player_row()   whether it plays, the entry and the row playing
  *   player_audio(out, n)             in the audio ISR: n stereo frames, Q15, interleaved L R
  *   player_track_name(track)         the chip and channel track 0..3 plays, as the screen names it ("NES · PULSE 1")
  * A new project's tracks 1 to 4 play NES Pulse 1, Pulse 2, Triangle and Noise (ADR 0002: one shared 2A03).
  * One row is one sixteenth at the project's BPM: a row starts with the first audio block (CTL samples, 0.7 ms) after
- * its time, the remainder carried, so the rows keep the tempo exactly on average. The tempo is read each block: a
- * change applies from the row playing on.
+ * its time, the remainder carried, so the rows keep the tempo exactly on average. Playing starts at the project's
+ * tempo; Fxx sets it to xx BPM from its row on (F00 .. F1F, FamiTracker's speed, do nothing: V-Track has none),
+ * the project's tempo changed (K4) sets it again. The entry playing is a place in the order list: entries added,
+ * deleted or moved before it play from there on; the entry playing deleted, the next row is the first entry's
+ * first. Bxx: after the row, entry xx (past the end: the last); Dxx: after the row, the next
+ * entry (with a Bxx in the row: Bxx's) from row xx (past its length: row 0). In the pattern-loop mode the entry
+ * after is the current one: Bxx does nothing, Dxx goes to its row xx.
  * A row's instrument column sets the track's instrument (it stays until another), its volume column the track's
  * volume (15 at the start; it applies to the note sounding too). A row's note starts the instrument: each of its
  * sequences (project.c: volume, arpeggio, pitch, duty or mode) from its first step, a step each NES frame (NTSC,
@@ -66,6 +75,7 @@ static const char *const PLAYER_NAME[PLAYER_TRACKS] = {"NES \xB7 PULSE 1", "NES 
 #define PLAYER_EFFECT_PORTA 4u               /* 3xx */
 #define PLAYER_VOL_MAX 0x7Fu             /* the row volume, Q3 (FamiTracker's: Axy slides it in eighths) */
 #define PLAYER_NO_FRAME 0xFFFFu          /* no Gxx / Sxx waiting */
+#define PLAYER_NO_JUMP 0xFFu             /* no Bxx / Dxx in the row */
 
 /* FamiTracker's vibrato (its new mode): a quarter sine of depth 4xy's y, by phase 0..15 */
 static const uint8_t PLAYER_VIB[16][16] = {
@@ -120,7 +130,10 @@ static struct {
     uint16_t delay[PLAYER_TRACKS], cut[PLAYER_TRACKS];   /* Gxx's and Sxx's frame, or PLAYER_NO_FRAME */
     uint8_t dnote[PLAYER_TRACKS], dins[PLAYER_TRACKS], dvol[PLAYER_TRACKS];   /* Gxx: the row's fields waiting */
     volatile uint8_t req;                /* PLAYER_REQ_*: from the main loop to the audio ISR, 0 = taken */
-    volatile uint8_t playing, row;
+    volatile uint8_t playing, entry, row;   /* the order list's entry playing and its row */
+    volatile uint8_t loop;               /* the pattern-loop mode: the current entry again and again */
+    uint8_t jump, skip;                  /* the row's Bxx entry and Dxx row, or PLAYER_NO_JUMP */
+    uint16_t bpm, bpm_seen;              /* the tempo playing (Fxx sets it), the project's as last seen */
     uint8_t count;                       /* the main loop's note-on count */
     uint32_t acc;                        /* the row's time so far, in 1 / BPM samples */
     int32_t mono[CTL];
@@ -165,13 +178,16 @@ static void player_init(void)
         player.voice[i][0].def_duty = player.voice[i][1].def_duty = i == PLAYER_NOISE ? 0u : 2u;
         player.delay[i] = player.cut[i] = PLAYER_NO_FRAME;
     }
-    player.req = player.playing = player.row = player.count = 0;
+    player.req = player.playing = player.entry = player.row = player.count = player.loop = 0;
 }
 
 static void player_play(void) { player.req = PLAYER_REQ_PLAY; }
 static void player_stop(void) { player.req = PLAYER_REQ_STOP; }
 static int player_playing(void) { return player.req ? player.req == PLAYER_REQ_PLAY : player.playing; }
 static uint32_t player_row(void) { return player.req == PLAYER_REQ_PLAY ? 0u : player.row; }
+static uint32_t player_entry(void) { return player.req == PLAYER_REQ_PLAY ? project_entry() : player.entry; }
+static void player_set_loop(uint32_t on) { player.loop = (uint8_t)(on != 0); }
+static int player_loop(void) { return player.loop; }
 
 static void player_note_on(uint32_t track, uint32_t note, uint32_t ins)
 {
@@ -397,6 +413,12 @@ static void player_effect(uint32_t t, player_voice_t *v, uint32_t e)   /* a row'
     case 'V': v->def_duty = v->s_duty = (uint8_t)p; return;
     case 'G': player.delay[t] = (uint16_t)(p ? p : PLAYER_NO_FRAME); return;
     case 'S': player.cut[t] = (uint16_t)p; return;
+    case 'B': player.jump = (uint8_t)p; return;
+    case 'D': player.skip = (uint8_t)p; return;
+    case 'F':
+        if (p >= 0x20u)                  /* (F01 .. F1F: FamiTracker's speed, which V-Track has not) */
+            player.bpm = (uint16_t)p;
+        return;
     default: return;
     }
     v->effect_p = (uint8_t)p;
@@ -447,34 +469,35 @@ static __attribute__((noinline)) void player_voices(uint32_t k)
     }
 }
 
-static uint32_t player_rows(void)        /* the loop: as long as the longest of the tracks' patterns */
+static uint32_t player_rows(uint32_t e)  /* entry e: as long as the longest of its patterns */
 {
     uint32_t t, n = 0;
     for (t = 0; t < PLAYER_TRACKS; t++) {
-        uint32_t r = project_rows(t);
+        uint32_t r = project_rows_of(t, project_order(e, t));
         n = r > n ? r : n;
     }
     return n;
 }
 
 /* the audio ISR, once a row: a note still delayed (Gxx) plays now; then the row's effect, instrument, volume and
- * note (Gxx: those later); past the loop's end, row 0 */
-static __attribute__((noinline)) void player_row_start(uint32_t row)
+ * note (Gxx: those later) */
+static __attribute__((noinline)) void player_row_start(uint32_t e, uint32_t row)
 {
     uint32_t t, note, ins, vol;
-    if (row >= player_rows())
-        row = 0;
+    player.entry = (uint8_t)e;
     player.row = (uint8_t)row;
+    player.jump = player.skip = PLAYER_NO_JUMP;
     for (t = 0; t < PLAYER_TRACKS; t++) {
         player_voice_t *pv = &player.voice[t][0];
+        uint32_t p = project_order(e, t);
         if (player.delay[t] != PLAYER_NO_FRAME)
             player_delayed(t);
         player.cut[t] = PLAYER_NO_FRAME;
         player.racc[t] = player.rframe[t] = 0;
-        player_effect(t, pv, project_field(t, row, PROJECT_F_EFFECT));
-        note = project_field(t, row, PROJECT_F_NOTE);
-        ins = project_field(t, row, PROJECT_F_INS);
-        vol = project_field(t, row, PROJECT_F_VOL);
+        player_effect(t, pv, project_field_of(t, p, row, PROJECT_F_EFFECT));
+        note = project_field_of(t, p, row, PROJECT_F_NOTE);
+        ins = project_field_of(t, p, row, PROJECT_F_INS);
+        vol = project_field_of(t, p, row, PROJECT_F_VOL);
         if (player.delay[t] != PLAYER_NO_FRAME) {
             player.dnote[t] = (uint8_t)note;
             player.dins[t] = (uint8_t)ins;
@@ -490,6 +513,25 @@ static __attribute__((noinline)) void player_row_start(uint32_t row)
     }
 }
 
+/* the audio ISR: the row's time is up, the next row. After an entry's last row the next entry (after the last, the
+ * first); Bxx: entry xx (past the end: the last), Dxx: the next entry (Bxx's with both) at row xx (past its length:
+ * row 0). In the pattern-loop mode the next entry is the current one (project_entry), Bxx does nothing. */
+static __attribute__((noinline)) void player_next_row(void)
+{
+    uint32_t n = project_orders(), e = player.entry, row = player.row + 1u;
+    if (e >= n || player.jump != PLAYER_NO_JUMP || player.skip != PLAYER_NO_JUMP || row >= player_rows(e)) {
+        e = player.loop                        ? project_entry()
+            : player.jump != PLAYER_NO_JUMP    ? (player.jump < n ? player.jump : n - 1u)
+                                               : e + 1u;
+        row = player.skip != PLAYER_NO_JUMP ? player.skip : 0u;
+    }
+    if (e >= n)                          /* (past the end; the entry playing deleted too) */
+        e = 0;
+    if (row >= player_rows(e))
+        row = 0;
+    player_row_start(e, row);
+}
+
 static __attribute__((noinline)) void player_transport(void)   /* the audio ISR: a play or stop asked for */
 {
     uint32_t t;
@@ -499,9 +541,10 @@ static __attribute__((noinline)) void player_transport(void)   /* the audio ISR:
         player.delay[t] = player.cut[t] = PLAYER_NO_FRAME;
     }
     player.acc = 0;
+    player.bpm = player.bpm_seen = (uint16_t)project_bpm();
     player.playing = player.req == PLAYER_REQ_PLAY;
     if (player.playing)
-        player_row_start(0);
+        player_row_start(project_entry(), 0);
     player.req = 0;                      /* (last: player_playing / player_row read the request until then) */
 }
 
@@ -537,9 +580,11 @@ static void player_audio(int32_t *out, uint32_t n)
         for (i = 0; i < k; i++)
             out[2u * i] = out[2u * i + 1u] = player.mono[i];
         /* the row's time is up: the next row from the next block on */
-        if (player.playing && (player.acc += k * project_bpm()) >= PLAYER_ROW_UNITS) {
+        if (project_bpm() != player.bpm_seen)   /* K4: the project's tempo, over Fxx's */
+            player.bpm = player.bpm_seen = (uint16_t)project_bpm();
+        if (player.playing && (player.acc += k * player.bpm) >= PLAYER_ROW_UNITS) {
             player.acc -= PLAYER_ROW_UNITS;
-            player_row_start(player.row + 1u);
+            player_next_row();
         }
     }
 }
