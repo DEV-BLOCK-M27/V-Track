@@ -84,6 +84,13 @@ int main(int argc, char **argv)
 
     sim_power_on();
     sim_run_ms(100);
+    sim_button(SMK_BTN_KNOB_BANK, 1);        /* shift + SEQ REC: velocity recording off (vt_record_test's) */
+    sim_run_ms(30);
+    sim_button(SMK_BTN_SEQ_REC, 1);
+    sim_run_ms(30);
+    sim_button(SMK_BTN_SEQ_REC, 0);
+    sim_button(SMK_BTN_KNOB_BANK, 0);
+    sim_run_ms(30);
 
     /* the view: the selected track in full, the other three as note columns */
     line_is("00", "00 ... .. . ... ... ... ...", "power-on: row 00, empty: note, instrument, volume, effect; 3 notes");

@@ -28,6 +28,9 @@
 #                   tests/vt_order_test.c: the order list (ARP: entries added, duplicated, deleted, moved), song
 #                   playback from the current entry looping at the end, the pattern-loop mode, Fxx Bxx Dxx, the
 #                   playing entry shown; the screen in build/host/order.ppm.
+#                   tests/vt_record_test.c: editing and recording (clear, insert and delete a row, copy and paste a
+#                   pattern, one level of undo, cut and release by shift + key, velocity into the volume column and
+#                   its switch, real-time recording into the rows playing); the screen in build/host/record.ppm.
 # NES chip core (seam B, tests/nes_test.c): register states in, samples out: duty waveforms, period -> frequency,
 #                   the triangle's staircase, the noise's periods and LFSR modes, the 2A03 mixer, no aliasing on
 #                   high notes.
@@ -145,6 +148,9 @@ run "DEVICE: effects 0xy 1xx 2xx 3xx 4xy Axy Vxx Gxx Sxx a NES frame at a time, 
 $CC $VT -o "$OUT/vt_order_test" tests/vt_order_test.c -lm
 run "DEVICE: the order list (add, duplicate, delete, move), song playback, pattern loop, Fxx Bxx Dxx, playing entry" \
     "$OUT/vt_order_test" "$OUT"
+$CC $VT -o "$OUT/vt_record_test" tests/vt_record_test.c
+run "DEVICE: editing (clear, insert, delete, copy, paste, undo) and recording (velocity, real time)" \
+    "$OUT/vt_record_test" "$OUT"
 
 # seam B: the NES chip core alone
 $CC -o "$OUT/nes_test" tests/nes_test.c -lm
@@ -205,6 +211,8 @@ else
     run "ASan/UBSan: DEVICE, effects" "$A/vt_effect_test"
     $SCC $VT -o "$A/vt_order_test" tests/vt_order_test.c -lm
     run "ASan/UBSan: DEVICE, the order list and song playback" "$A/vt_order_test"
+    $SCC $VT -o "$A/vt_record_test" tests/vt_record_test.c
+    run "ASan/UBSan: DEVICE, editing and recording" "$A/vt_record_test"
     $SCC -o "$A/nes_test" tests/nes_test.c -lm
     run "ASan/UBSan: NES chip core" "$A/nes_test"
 fi

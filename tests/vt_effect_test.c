@@ -338,6 +338,13 @@ int main(void)
 
     sim_power_on();
     sim_run_ms(100);
+    sim_button(SMK_BTN_KNOB_BANK, 1);        /* shift + SEQ REC: velocity recording off (vt_record_test's) */
+    sim_run_ms(30);
+    sim_button(SMK_BTN_SEQ_REC, 1);
+    sim_run_ms(30);
+    sim_button(SMK_BTN_SEQ_REC, 0);
+    sim_button(SMK_BTN_KNOB_BANK, 0);
+    sim_run_ms(30);
 
     /* 0xy arpeggio on track 1 (a plain tone): row 00 C-6 047, 02 000, 04 C-6 040 */
     new_pattern();

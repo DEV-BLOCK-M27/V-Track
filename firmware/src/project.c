@@ -31,6 +31,17 @@
  *                                         EFFECT: PROJECT_EFFECT(letter, parameter 0..255), the letter one of
  *                                                 PROJECT_EFFECT_LETTERS
  *   project_set_field(track, row, f, v) writes it (anything else is refused: the row stays as it was)
+ *   project_set_field_of(track, p, row, f, v)   .. into pattern p of the track
+ *   project_clear_row(track, row)       every field of the row empty (an empty row: no edit, no undo step)
+ *   project_insert_row(track, row)      an empty row there, the rows below a row down (the last one falls off)
+ *   project_delete_row(track, row)      the row taken out, the rows below a row up (the last one empty)
+ *   project_copy(track)                 the track's pattern (its rows and length) copied
+ *   project_paste(track)                .. into the track's pattern: an identical one; 1 if done, 0 if none copied
+ *   project_checkpoint(track), project_checkpoint_of(track, p)   the undo step: the pattern as it is now, before
+ *                                       an edit (clear, insert, delete and paste take it themselves)
+ *   project_undo()                      the pattern of the undo step back as it was (its rows and length); 1 if
+ *                                       done, 0 if there is none (one level: an undo uses it up). A new project
+ *                                       has none; the copied pattern stays
  *   project_bpm(), project_set_bpm(b)   the tempo, one row a sixteenth; kept within PROJECT_BPM_MIN .. MAX
  *   project_ins_chip(i)                 the chip instrument 0..15 belongs to (ADR 0002), PROJECT_CHIP_NONE: a free slot
  *   project_ins_name(i)                 its name ("" for a free slot)
@@ -120,6 +131,14 @@ static struct {
     volatile uint8_t entry;              /* the current entry, 0 .. orders - 1 */
     volatile uint16_t bpm;
 } project;
+
+typedef struct {                         /* one pattern's rows: the undo step, the copied pattern */
+    uint8_t valid, track, p, rows;
+    uint8_t note[PROJECT_ROWS], ins[PROJECT_ROWS], vol[PROJECT_ROWS];
+    uint16_t effect[PROJECT_ROWS];
+} project_snap_t;
+
+static project_snap_t project_undo_snap, project_copied;
 
 static uint32_t project_ins_chip(uint32_t i)
 {
@@ -276,6 +295,7 @@ static void project_init(void)
     project.orders = 1;
     project.entry = 0;
     project.bpm = 120;
+    project_undo_snap.valid = 0;         /* (the copied pattern stays: it can go into another project) */
 }
 
 static uint32_t project_clamp(int32_t v, uint32_t n)   /* v within 0 .. n - 1 */
@@ -427,12 +447,10 @@ static int project_effect_ok(uint32_t v)     /* an effect: a letter of PROJECT_E
     return 0;
 }
 
-static void project_set_field(uint32_t track, uint32_t row, uint32_t f, uint32_t v)
+static void project_set_field_of(uint32_t track, uint32_t p, uint32_t row, uint32_t f, uint32_t v)
 {
-    uint32_t p;
-    if (row >= project_rows(track))
+    if (row >= project_rows_of(track, p))
         return;
-    p = project_pattern(track);
     if (f == PROJECT_F_NOTE && (v == PROJECT_EMPTY || PROJECT_IS_NOTE(v) || v == PROJECT_CUT || v == PROJECT_RELEASE))
         project_pat.note[track][p][row] = (uint8_t)v;
     if (f == PROJECT_F_INS && v <= PROJECT_INS(PROJECT_INSTRUMENTS - 1u))
@@ -441,6 +459,115 @@ static void project_set_field(uint32_t track, uint32_t row, uint32_t f, uint32_t
         project_pat.vol[track][p][row] = (uint8_t)v;
     if (f == PROJECT_F_EFFECT && (v == PROJECT_EMPTY || project_effect_ok(v)))
         project_pat.effect[track][p][row] = (uint16_t)v;
+}
+
+static void project_set_field(uint32_t track, uint32_t row, uint32_t f, uint32_t v)
+{
+    project_set_field_of(track, project_pattern(track), row, f, v);
+}
+
+/* --- editing: rows, copy and paste, undo --- */
+
+static void project_snapshot(project_snap_t *d, uint32_t track, uint32_t p)   /* pattern p of track into d */
+{
+    uint32_t r;
+    d->track = (uint8_t)track, d->p = (uint8_t)p, d->rows = project_pat.rows[track][p];
+    for (r = 0; r < PROJECT_ROWS; r++) {
+        d->note[r] = project_pat.note[track][p][r], d->ins[r] = project_pat.ins[track][p][r];
+        d->vol[r] = project_pat.vol[track][p][r], d->effect[r] = project_pat.effect[track][p][r];
+    }
+    d->valid = 1;
+}
+
+static void project_restore(const project_snap_t *s, uint32_t track, uint32_t p)   /* s into pattern p of track */
+{
+    uint32_t r;
+    for (r = 0; r < PROJECT_ROWS; r++) {
+        project_pat.note[track][p][r] = s->note[r], project_pat.ins[track][p][r] = s->ins[r];
+        project_pat.vol[track][p][r] = s->vol[r], project_pat.effect[track][p][r] = s->effect[r];
+    }
+    project_pat.rows[track][p] = s->rows;
+}
+
+static void project_checkpoint_of(uint32_t track, uint32_t p)
+{
+    if (track < PROJECT_TRACKS && p < PROJECT_PATTERNS)
+        project_snapshot(&project_undo_snap, track, p);
+}
+
+static void project_checkpoint(uint32_t track) { project_checkpoint_of(track, project_pattern(track)); }
+
+static int project_undo(void)
+{
+    if (!project_undo_snap.valid)
+        return 0;
+    project_restore(&project_undo_snap, project_undo_snap.track, project_undo_snap.p);
+    project_undo_snap.valid = 0;
+    return 1;
+}
+
+static void project_row_copy(uint32_t track, uint32_t p, uint32_t to, uint32_t from)   /* row from into row to */
+{
+    project_pat.note[track][p][to] = project_pat.note[track][p][from];
+    project_pat.ins[track][p][to] = project_pat.ins[track][p][from];
+    project_pat.vol[track][p][to] = project_pat.vol[track][p][from];
+    project_pat.effect[track][p][to] = project_pat.effect[track][p][from];
+}
+
+static void project_row_empty(uint32_t track, uint32_t p, uint32_t row)
+{
+    project_pat.note[track][p][row] = project_pat.ins[track][p][row] = project_pat.vol[track][p][row] = PROJECT_EMPTY;
+    project_pat.effect[track][p][row] = PROJECT_EMPTY;
+}
+
+static void project_clear_row(uint32_t track, uint32_t row)
+{
+    uint32_t f;
+    for (f = PROJECT_F_NOTE; f <= PROJECT_F_EFFECT && project_field(track, row, f) == PROJECT_EMPTY; f++)
+        ;
+    if (f > PROJECT_F_EFFECT)
+        return;                          /* empty already (or past the end): no edit, the undo step kept */
+    project_checkpoint(track);
+    project_row_empty(track, project_pattern(track), row);
+}
+
+static void project_insert_row(uint32_t track, uint32_t row)
+{
+    uint32_t p, n = project_rows(track), r;
+    if (row >= n)
+        return;
+    project_checkpoint(track);
+    p = project_pattern(track);
+    for (r = n - 1u; r > row; r--)
+        project_row_copy(track, p, r, r - 1u);
+    project_row_empty(track, p, row);
+}
+
+static void project_delete_row(uint32_t track, uint32_t row)
+{
+    uint32_t p, n = project_rows(track), r;
+    if (row >= n)
+        return;
+    project_checkpoint(track);
+    p = project_pattern(track);
+    for (r = row; r + 1u < n; r++)
+        project_row_copy(track, p, r, r + 1u);
+    project_row_empty(track, p, n - 1u);
+}
+
+static void project_copy(uint32_t track)
+{
+    if (track < PROJECT_TRACKS)
+        project_snapshot(&project_copied, track, project_pattern(track));
+}
+
+static int project_paste(uint32_t track)
+{
+    if (track >= PROJECT_TRACKS || !project_copied.valid)
+        return 0;
+    project_checkpoint(track);
+    project_restore(&project_copied, track, project_pattern(track));
+    return 1;
 }
 
 static uint32_t project_bpm(void) { return project.bpm; }

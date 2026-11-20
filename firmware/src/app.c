@@ -7,11 +7,11 @@
  *   app_frame()         each main-loop frame (~60 a second): input in, LEDs and display out
  *   app_idle()          between frames, as often as the main loop gets round to it
  *   app_audio(out, n)   in the audio ISR: n stereo frames, Q15, interleaved L R
- * Three views. The pattern view (docs/design/pattern-view.png): a header (the track, its chip and channel, its
- * pattern Pxx; the tempo, REC, the pattern's length) over 13 rows of the selected track's pattern, all four columns
- * (note, instrument, volume, effect), and the other three tracks' note columns right of a separator. The cursor row
- * has a blue bar, the playing row a red one (both: purple). The screen follows the cursor, scrolling as little as
- * keeps it shown; a page turned shows the page from its first row.
+ * Three views. The pattern view (docs/design/pattern-view.png): a header (the track, its chip and channel, the
+ * modes LOOP REC VEL, its pattern Pxx; the tempo, the selected instrument, the pattern's length) over 13 rows of
+ * the selected track's pattern, all four columns (note, instrument, volume, effect), and the other three tracks'
+ * note columns right of a separator. The cursor row has a blue bar, the playing row a red one (both: purple). The
+ * screen follows the cursor, scrolling as little as keeps it shown; a page turned shows the page from its first row.
  * K2 moves the cursor (it stops at the first and last row), shift (KNOB BANK) + K2 sets the pattern's length (16 to
  * 64 rows). K3 selects the track (1 to 4, it stops at the ends), K4 sets the tempo (1 BPM a detent). K5 to K8 edit
  * the cursor row's note (a semitone a detent, C-0 to B-7), instrument (00 to 0F), volume (0 to F) and effect
@@ -23,11 +23,18 @@
  * The pattern view shows the current entry's patterns (the order list's cursor); the playing row only while that
  * entry plays. SEQ PLAY starts and stops the order list from the current entry (player.c: it loops at its end),
  * shift + SEQ PLAY switches the pattern-loop mode (the current entry over and over; LOOP in the header), SEQ REC
- * switches recording (both LEDs show it).
+ * switches recording (both LEDs show it), shift + SEQ REC velocity recording (on at the start; VEL in the header).
  * With REC on and the sequencer stopped a key also writes its note into the cursor row, and shift with a white key
  * a cut, with a black key a release (shift keeps the keys from playing); the cursor then moves down a row (after
- * the last row, to the first). The pads show the 16 rows of the cursor's page: empty, a note (cut and release too),
- * the cursor, the playing row, dark past the pattern's end; a tap moves the cursor to its row.
+ * the last row, to the first). With REC on and the sequencer playing they land in the row playing (of the entry
+ * playing) instead; the cursor stays. With velocity recording on a note also writes the key's velocity into the
+ * volume column (velocity / 8, at least 1: 1 to F). PARA clears the cursor row, CHORD inserts an empty row there
+ * (the rows below a row down), shift + CHORD deletes it (the rows below a row up); SCALE copies the track's pattern,
+ * shift + SCALE pastes it into the track's pattern (shift + < > select another number first). Shift + PARA undoes
+ * the last edit of a pattern (one level): a clear, insert, delete, paste, a key recorded, the turns of K5 to K8 on
+ * one field of one row, the turns of shift + K2 (the length). The pads show the 16 rows of the cursor's page:
+ * empty, a note (cut and release too), the cursor, the playing row, dark past the pattern's end; a tap moves the
+ * cursor to its row.
  * NOTE REPEAT switches the pads to instrument mode and back (its LED lit in instrument mode): pads 1 to 16 are
  * instruments 00 to 0F, those of the selected track's chip lit (the selected one brighter), the others (free slots,
  * other chips) dark, taking no tap. A tap selects the instrument: the header shows it (INSxx and its name), the keys
@@ -97,6 +104,8 @@
 #define VT_LINE_CURSOR 1u        /* vt_line_t.mark */
 #define VT_LINE_PLAYING 2u
 #define VT_LINE_PAST 4u          /* past the pattern's end: blank */
+#define VT_EDIT_LENGTH 4u        /* app.edit.what: the pattern's length (shift + K2), past the PROJECT_F_* fields */
+#define VT_EDIT_NONE 0xFFu       /* .. no field edit going on */
 #define VT_NO_INS PLAYER_NO_INS  /* no instrument selected */
 #define VT_VIEW_PATTERN 0u       /* app.view */
 #define VT_VIEW_EDITOR 1u
@@ -145,6 +154,10 @@ static struct {
     uint8_t cursor;              /* the cursor row */
     uint8_t top;                 /* the first row on the screen */
     uint8_t rec;                 /* SEQ REC on */
+    uint8_t vel;                 /* recording writes the key's velocity into the volume column */
+    struct {                     /* the field edit going on: its turns are one undo step */
+        uint8_t track, pattern, row, what;   /* what: a PROJECT_F_* field, VT_EDIT_LENGTH; VT_EDIT_NONE: none */
+    } edit;
     uint8_t pad_ins;             /* the pads in instrument mode */
     uint8_t ins;                 /* the selected instrument 0..15, VT_NO_INS */
     uint8_t last[PROJECT_F_EFFECT];   /* by PROJECT_F_*: the note, instrument and volume written last (an empty
@@ -197,6 +210,8 @@ static void app_start(void)
     app.track = 0;
     app.cursor = app.top = 0;
     app.rec = 0;
+    app.vel = 1;
+    app.edit.what = VT_EDIT_NONE;
     app.pad_ins = 0;
     app.ins = VT_NO_INS;
     app.last[PROJECT_F_NOTE] = PROJECT_NOTE(60u);   /* C-4 */
@@ -255,7 +270,10 @@ static void app_bpm_text(char *s)    /* the project's tempo: "120 BPM" */
 
 static void app_cursor(int32_t r)    /* the cursor to row r, within the pattern; the screen follows */
 {
-    app.cursor = (uint8_t)app_clamp(r, 0, (int32_t)project_rows(app.track) - 1);
+    uint8_t c = (uint8_t)app_clamp(r, 0, (int32_t)project_rows(app.track) - 1);
+    if (c != app.cursor && app.edit.what != VT_EDIT_LENGTH)
+        app.edit.what = VT_EDIT_NONE;    /* (a field edit ends with the cursor leaving its row) */
+    app.cursor = c;
     app_follow();
 }
 
@@ -275,15 +293,72 @@ static void app_page_or_pattern(int32_t dir, uint32_t shift)
     app_cursor((int32_t)app.cursor + dir * (int32_t)VT_PAGE);   /* (rows 0D to 0F of a page: the screen follows) */
 }
 
-static void app_enter(uint32_t v)    /* REC, stopped: v into the cursor row, the cursor down a row */
+static void app_undo_step_new(void) { app.edit.what = VT_EDIT_NONE; }   /* the next field edit: its own undo step */
+
+/* REC: v (a note, cut or release; a key's velocity vel) into the selected track's row: stopped the cursor row (the
+ * cursor then down a row), playing the row playing (of the entry playing). A note also writes the selected
+ * instrument, and its velocity as the volume (1 to F) unless velocity recording is off. One undo step */
+static void app_record(uint32_t v, uint32_t vel)
 {
-    project_set_field(app.track, app.cursor, PROJECT_F_NOTE, v);
+    uint32_t playing = player_playing(), e, row, p;
+    do {                                 /* the entry and row playing, as one (the audio ISR moves them on) */
+        row = player_row();
+        e = player_entry();
+    } while (playing && row != player_row());
+    p = playing ? project_order(e, app.track) : project_pattern(app.track);
+    row = playing ? row : app.cursor;
+    project_checkpoint_of(app.track, p);
+    app_undo_step_new();
+    project_set_field_of(app.track, p, row, PROJECT_F_NOTE, v);
     if (PROJECT_IS_NOTE(v)) {
         app.last[PROJECT_F_NOTE] = (uint8_t)v;
         if (app.ins != VT_NO_INS)
-            project_set_field(app.track, app.cursor, PROJECT_F_INS, PROJECT_INS(app.ins));
+            project_set_field_of(app.track, p, row, PROJECT_F_INS, PROJECT_INS(app.ins));
+        if (app.vel)
+            project_set_field_of(app.track, p, row, PROJECT_F_VOL, PROJECT_VOL(vel >> 3 ? vel >> 3 : 1u));
     }
-    app_cursor(app.cursor + 1u < project_rows(app.track) ? (int32_t)app.cursor + 1 : 0);
+    if (!playing)
+        app_cursor(app.cursor + 1u < project_rows(app.track) ? (int32_t)app.cursor + 1 : 0);
+}
+
+/* a field edit about to change what (a PROJECT_F_* field of the cursor row, VT_EDIT_LENGTH): a new undo step,
+ * unless it goes on with the one before (the same field of the same row, the same length, turned again) */
+static void app_undo_step_join(uint32_t what)
+{
+    uint32_t pattern = project_pattern(app.track), row = what == VT_EDIT_LENGTH ? 0u : app.cursor;
+    if (app.edit.what == what && app.edit.track == app.track && app.edit.pattern == pattern && app.edit.row == row)
+        return;
+    project_checkpoint(app.track);
+    app.edit.track = app.track, app.edit.pattern = (uint8_t)pattern, app.edit.row = (uint8_t)row;
+    app.edit.what = (uint8_t)what;
+}
+
+/* the pattern view's editing buttons: PARA clears the cursor row, shift + PARA undoes the last edit; CHORD inserts
+ * a row at the cursor, shift + CHORD deletes it; SCALE copies the pattern, shift + SCALE pastes it */
+static void app_edit_button(uint32_t b, uint32_t shift)
+{
+    app_undo_step_new();
+    if (b == SMK_BTN_PARA && shift)
+        project_undo();
+    else if (b == SMK_BTN_PARA)
+        project_clear_row(app.track, app.cursor);
+    else if (b == SMK_BTN_CHORD && shift)
+        project_delete_row(app.track, app.cursor);
+    else if (b == SMK_BTN_CHORD)
+        project_insert_row(app.track, app.cursor);
+    else if (b == SMK_BTN_SCALE && shift)
+        project_paste(app.track);
+    else if (b == SMK_BTN_SCALE)
+        project_copy(app.track);
+    app_cursor(app.cursor);              /* (an undo or paste may change the length) */
+}
+
+static void app_write_field(uint32_t f, uint32_t v)   /* field f of the cursor row set to v: an edit if it changes */
+{
+    if (v == project_field(app.track, app.cursor, f))
+        return;                          /* (a turn at an end: the undo step before it kept) */
+    app_undo_step_join(f);
+    project_set_field(app.track, app.cursor, f, v);
 }
 
 /* K5 to K8 turned: field f of the cursor row. An empty field (a cut or release too) takes the value written last,
@@ -305,11 +380,11 @@ static void app_edit(uint32_t f, int32_t steps, uint32_t shift)
         } else if (v) {
             v = PROJECT_EFFECT(v >> 8, (uint32_t)app_clamp((int32_t)(v & 0xFFu) + steps, 0, 255));
         }
-        project_set_field(app.track, app.cursor, f, v);
+        app_write_field(f, v);
         return;
     }
     if (shift) {
-        project_set_field(app.track, app.cursor, f, PROJECT_EMPTY);
+        app_write_field(f, PROJECT_EMPTY);
         return;
     }
     if (f == PROJECT_F_NOTE) {
@@ -325,7 +400,7 @@ static void app_edit(uint32_t f, int32_t steps, uint32_t shift)
         steps -= steps > 0 ? 1 : -1;     /* the first detent: the last value */
     }
     v = (uint32_t)app_clamp((int32_t)v + steps, lo, hi);
-    project_set_field(app.track, app.cursor, f, v);
+    app_write_field(f, v);
     app.last[f] = (uint8_t)v;
 }
 
@@ -337,8 +412,7 @@ static int app_black(uint32_t k)     /* keybed key k is a black key */
 static void app_keys(void)           /* the keybed: releases, then the highest key newly pressed */
 {
     uint64_t now = fm1_in.keys, down = now & ~app.keys, up = app.keys & ~now;
-    uint32_t k, shift = fm1_in.buttons >> SMK_BTN_KNOB_BANK & 1u, enter = app.rec && !player_playing() &&
-                                                                          app.view == VT_VIEW_PATTERN;
+    uint32_t k, shift = fm1_in.buttons >> SMK_BTN_KNOB_BANK & 1u, enter = app.rec && app.view == VT_VIEW_PATTERN;
     app.keys = now;
     for (k = 0; k < FM1_NKEY; k++)
         if (up >> k & 1u)
@@ -347,13 +421,13 @@ static void app_keys(void)           /* the keybed: releases, then the highest k
         if (down >> k & 1u) {
             if (shift) {                 /* shift: cut or release, no sound */
                 if (enter)
-                    app_enter(app_black(k) ? PROJECT_RELEASE : PROJECT_CUT);
+                    app_record(app_black(k) ? PROJECT_RELEASE : PROJECT_CUT, 0);
                 break;
             }
             app.key_track[k] = app.track;
             player_note_on(app.track, VT_KEY_NOTE0 + k, app.ins);
             if (enter)
-                app_enter(PROJECT_NOTE(VT_KEY_NOTE0 + k));
+                app_record(PROJECT_NOTE(VT_KEY_NOTE0 + k), fm1_in.key_vel[k]);
             break;
         }
 }
@@ -523,7 +597,9 @@ static void app_input(void)          /* take every input event */
         else
             player_play();
     }
-    if (pressed >> SMK_BTN_SEQ_REC & 1u)
+    if (pressed >> SMK_BTN_SEQ_REC & 1u && shift)   /* shift + SEQ REC: velocity recording */
+        app.vel ^= 1u;
+    else if (pressed >> SMK_BTN_SEQ_REC & 1u)
         app.rec ^= 1u;
     if (pressed >> SMK_BTN_NOTE_REPEAT & 1u)
         app.pad_ins ^= 1u;
@@ -537,6 +613,12 @@ static void app_input(void)          /* take every input event */
         app_order_button(-1, shift);
     if (app.view == VT_VIEW_ORDER && pressed >> SMK_BTN_RIGHT & 1u)
         app_order_button(1, shift);
+    if (app.view == VT_VIEW_PATTERN && pressed >> SMK_BTN_PARA & 1u)
+        app_edit_button(SMK_BTN_PARA, shift);
+    if (app.view == VT_VIEW_PATTERN && pressed >> SMK_BTN_CHORD & 1u)
+        app_edit_button(SMK_BTN_CHORD, shift);
+    if (app.view == VT_VIEW_PATTERN && pressed >> SMK_BTN_SCALE & 1u)
+        app_edit_button(SMK_BTN_SCALE, shift);
     if (app.view == VT_VIEW_PATTERN && pressed >> SMK_BTN_LEFT & 1u)
         app_page_or_pattern(-1, shift);
     if (app.view == VT_VIEW_PATTERN && pressed >> SMK_BTN_RIGHT & 1u)
@@ -561,7 +643,11 @@ static void app_input(void)          /* take every input event */
             continue;
         }
         if (e == VT_ENC_CURSOR && shift) {   /* shift + K2: the pattern's length */
-            project_set_rows(app.track, (int32_t)project_rows(app.track) + s);
+            int32_t n = app_clamp((int32_t)project_rows(app.track) + s, (int32_t)PROJECT_ROWS_MIN, (int32_t)PROJECT_ROWS);
+            if ((uint32_t)n != project_rows(app.track)) {
+                app_undo_step_join(VT_EDIT_LENGTH);
+                project_set_rows(app.track, n);
+            }
             app_cursor(app.cursor);
         } else if (e == VT_ENC_CURSOR) {
             app_cursor((int32_t)app.cursor + s);
@@ -649,13 +735,12 @@ static uint32_t app_head_key(void)   /* what the header shows, as one word (neve
 {
     return 1u | (uint32_t)app.track << 1 | (uint32_t)app.rec << 3 | project_bpm() << 4 |
            project_rows(app.track) << 13 | project_pattern(app.track) << 20 | (uint32_t)player_loop() << 25 |
-           (uint32_t)((app.ins + 1u) & 0x1Fu) << 26;
+           (uint32_t)((app.ins + 1u) & 0x1Fu) << 26 | (uint32_t)app.vel << 31;
 }
 
 static void app_draw_head(void)
 {
     char s[12];
-    uint32_t n;
     int32_t x;
     cv_begin(240, VT_HEAD_H, VT_C_HEAD);
     s[0] = 'T';
@@ -665,7 +750,13 @@ static void app_draw_head(void)
     cv_text(26, 1, &AF_S, player_track_name(app.track), VT_C_TEXT);
     s[0] = 'P';
     app_hex(project_pattern(app.track), 2, s + 1);
-    cv_text_r(232, 1, &AF_S, s, VT_C_TEXT, VT_C_HEAD);
+    x = cv_text_r(232, 1, &AF_S, s, VT_C_TEXT, VT_C_HEAD);
+    if (app.vel)                         /* the modes left of it: velocity recording, REC, the pattern loop */
+        x = cv_text_r(x - 8, 1, &AF_S, "VEL", VT_C_HEAD_DIM, VT_C_HEAD);
+    if (app.rec)
+        x = cv_text_r(x - 8, 1, &AF_S, "REC", VT_C_HEAD_DIM, VT_C_HEAD);
+    if (player_loop())
+        cv_text_r(x - 8, 1, &AF_S, "LOOP", VT_C_HEAD_DIM, VT_C_HEAD);
     s[0] = (char)('0' + project_rows(app.track) / 10u);
     s[1] = (char)('0' + project_rows(app.track) % 10u);
     memcpy(s + 2, " ROWS", 6);
@@ -677,11 +768,7 @@ static void app_draw_head(void)
         cv_text_r(x - 5, 15, &AF_S, s, VT_C_INS, VT_C_HEAD);
     }
     app_bpm_text(s);
-    n = (uint32_t)cv_text(8, 15, &AF_S, s, VT_C_HEAD_DIM);
-    if (app.rec)
-        n = (uint32_t)cv_text((int32_t)n + 12, 15, &AF_S, "REC", VT_C_HEAD_DIM);
-    if (player_loop())
-        cv_text((int32_t)n + 12, 15, &AF_S, "LOOP", VT_C_HEAD_DIM);
+    cv_text(8, 15, &AF_S, s, VT_C_HEAD_DIM);
     cv_blit(0, 0);
 }
 

@@ -233,6 +233,13 @@ int main(int argc, char **argv)
 
     sim_power_on();
     sim_run_ms(100);
+    sim_button(SMK_BTN_KNOB_BANK, 1);        /* shift + SEQ REC: velocity recording off (vt_record_test's) */
+    sim_run_ms(30);
+    sim_button(SMK_BTN_SEQ_REC, 1);
+    sim_run_ms(30);
+    sim_button(SMK_BTN_SEQ_REC, 0);
+    sim_button(SMK_BTN_KNOB_BANK, 0);
+    sim_run_ms(30);
 
     /* instrument mode: NOTE REPEAT; the factory instruments 00 to 04 lit, the free slots dark */
     button(SMK_BTN_NOTE_REPEAT);

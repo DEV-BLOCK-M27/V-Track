@@ -163,6 +163,13 @@ int main(int argc, char **argv)
 
     sim_power_on();
     sim_run_ms(100);
+    sim_button(SMK_BTN_KNOB_BANK, 1);        /* shift + SEQ REC: velocity recording off (vt_record_test's) */
+    sim_run_ms(30);
+    sim_button(SMK_BTN_SEQ_REC, 1);
+    sim_run_ms(30);
+    sim_button(SMK_BTN_SEQ_REC, 0);
+    sim_button(SMK_BTN_KNOB_BANK, 0);
+    sim_run_ms(30);
 
     /* step entry: REC on, stopped; C4, E4, G4 go to rows 1, 2, 3 of track 1 */
     button(SMK_BTN_SEQ_REC);
