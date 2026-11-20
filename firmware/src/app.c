@@ -63,6 +63,17 @@
  * + > a copy of it, the cursor to it; shift + < deletes the cursor's entry (not the last one; < alone: nothing). The
  * pads show the 16 entries of the cursor's page (an entry, the cursor, the playing one, dark past the end); a tap
  * moves the cursor there. The keys play the selected track (step entry is off).
+ * GLOBE opens the project view (store.c), SEQ goes back to the pattern view; GLOBE's LED is lit there. A header
+ * (PROJECT, the project's name with the name's cursor under a character; the project memory's fullness, MEMORY n%,
+ * over a bar) over the four slots (the number and the name of the project saved there, or EMPTY; the selected one
+ * with a blue bar), a message line and two lines of help. K2 selects the slot (pads 1 to 4 too: the selected one
+ * bright, a saved project dim), K4 sets the name's character at its cursor, shift + K4 moves the cursor (as the
+ * editor's name). > saves the project to the slot (over a saved project it asks first: > again); < loads the slot's
+ * project (it asks first: < again), shift + < starts a new project (it asks first: shift + < again). Loading and a
+ * new project stop the sequencer; the views start from the new project's first row, no instrument selected. A
+ * project the memory has no room for is refused with NOT SAVED: MEMORY FULL (the slot keeps what it held); an
+ * autosave the memory has no room for shows AUTOSAVE: MEMORY FULL. Any other button or encoder takes the question
+ * back. K3 selects the track, the keys play it (step entry is off).
  * Every other input (USB MIDI in too) is taken and dropped. */
 #define VT_NAME "V-Track"
 #define VT_KEY_NOTE0 48u         /* keybed key 0 = C3 (MIDI 48) */
@@ -110,6 +121,15 @@
 #define VT_VIEW_PATTERN 0u       /* app.view */
 #define VT_VIEW_EDITOR 1u
 #define VT_VIEW_ORDER 2u
+#define VT_VIEW_PROJECT 3u
+#define VT_ASK_NONE 0u           /* app.ask: the project view's action waiting for its second press */
+#define VT_ASK_SAVE 1u
+#define VT_ASK_LOAD 2u
+#define VT_ASK_NEW 3u
+#define VT_P_SLOT_Y 38           /* the project view: the slots' lines, the message's, the help lines' */
+#define VT_P_MSG_Y 110
+#define VT_P_HELP_Y 196
+#define VT_C_FULL RGB(230, 80, 60)   /* the memory's bar, nearly full */
 #define VT_O_X 64                /* the order list: each track's pattern column, VT_O_W apart */
 #define VT_O_W 44
 #define VT_ENC_STEP 1u           /* the editor: K2 step, K3 sequence, K4 name, K5 value, K6 length, K7 loop, */
@@ -171,6 +191,8 @@ static struct {
     vt_panel_t panel[PROJECT_SEQS];   /* what each sequence's panel shows */
     uint8_t otop;                /* the order list: the first entry on the screen */
     vt_oline_t oshown[VT_SHOWN]; /* what each of its lines shows */
+    uint8_t slot, pname_pos, ask;   /* the project view: the slot, the name's cursor, the action asked (VT_ASK_*) */
+    char msg[32];                /* .. its message */
 } app;
 
 static const uint8_t VT_PAD_EMPTY[3] = {2, 2, 6}, VT_PAD_NOTE[3] = {0, 20, 60}, VT_PAD_CURSOR[3] = {60, 60, 60},
@@ -188,7 +210,7 @@ static void app_boot_screen(void)
     palette_set(UI_GREY_INDEX);
     app_name_screen(100);
     draw_text_box(0, 128, 240, &AF_S, FELUCCA_VERSION, T_MID, 1);
-    project_init();
+    store_boot();                        /* the autosaved project, or a new one */
     player_init();                       /* before the audio ISR runs it */
 }
 
@@ -222,6 +244,9 @@ static void app_start(void)
     app.view = VT_VIEW_PATTERN;
     app.seq = app.step = app.name_pos = 0;
     app.otop = 0;
+    app.slot = app.pname_pos = 0;
+    app.ask = VT_ASK_NONE;
+    app.msg[0] = 0;
     lcd_fill(0, 0, 240, 240, VT_C_BG);
 }
 
@@ -448,6 +473,8 @@ static void app_view(uint32_t v)     /* PATCH: the editor for the selected instr
         app.last[PROJECT_F_INS] = (uint8_t)PROJECT_INS(app.ins);
     if (v == VT_VIEW_PATTERN)
         app_cursor(app.cursor);          /* (the entry's patterns may be shorter) */
+    if (v == VT_VIEW_PROJECT && v != app.view)
+        app.ask = VT_ASK_NONE, app.msg[0] = 0;
     if (v != app.view) {
         app.view = (uint8_t)v;
         app_redraw();
@@ -455,23 +482,28 @@ static void app_view(uint32_t v)     /* PATCH: the editor for the selected instr
     }
 }
 
-static void app_editor_edit(uint32_t e, int32_t steps, uint32_t shift)   /* an encoder turned in the editor */
+/* name n with its character at pos turned steps through CHARS (stopping at the ends), into name (padded with spaces) */
+static void app_name_turn(char *name, const char *n, uint32_t pos, int32_t steps)
 {
     static const char CHARS[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-";
+    uint32_t k, c = 0, end = 0;
+    for (k = 0; k + 1u < PROJECT_NAME; k++)
+        name[k] = end || !n[k] ? (end = 1, ' ') : n[k];
+    name[PROJECT_NAME - 1u] = 0;
+    while (CHARS[c] && CHARS[c] != name[pos])
+        c++;
+    c = (uint32_t)app_clamp((int32_t)(CHARS[c] ? c : 0u) + steps, 0, (int32_t)sizeof CHARS - 2);
+    name[pos] = CHARS[c];
+}
+
+static void app_editor_edit(uint32_t e, int32_t steps, uint32_t shift)   /* an encoder turned in the editor */
+{
     const project_seq_t *q;
     if (e == VT_ENC_NAME && shift)
         app.name_pos = (uint8_t)app_clamp((int32_t)app.name_pos + steps, 0, PROJECT_NAME - 2);
-    if (e == VT_ENC_NAME && !shift) {    /* the character at the name's cursor: through CHARS, stopping at the ends */
+    if (e == VT_ENC_NAME && !shift) {    /* the character at the name's cursor */
         char name[PROJECT_NAME];
-        const char *n = project_ins_name(app.ins);
-        uint32_t k, c = 0, end = 0;
-        for (k = 0; k + 1u < PROJECT_NAME; k++)
-            name[k] = end || !n[k] ? (end = 1, ' ') : n[k];   /* (padded with spaces) */
-        name[PROJECT_NAME - 1u] = 0;
-        while (CHARS[c] && CHARS[c] != name[app.name_pos])
-            c++;
-        c = (uint32_t)app_clamp((int32_t)(CHARS[c] ? c : 0u) + steps, 0, (int32_t)sizeof CHARS - 2);
-        name[app.name_pos] = CHARS[c];
+        app_name_turn(name, project_ins_name(app.ins), app.name_pos, steps);
         project_set_ins_name(app.ins, name);
     }
     if (e == VT_ENC_STEP)
@@ -541,6 +573,95 @@ static void app_order_edit(uint32_t enc, int32_t steps, uint32_t shift)   /* an 
         project_set_order(e, enc - VT_ENC_NOTE, (int32_t)project_order(e, enc - VT_ENC_NOTE) + steps);
 }
 
+/* --- the project view (GLOBE) --- */
+
+static void app_say(const char *a, int32_t slot, const char *b)   /* the message: a, the slot's number, b */
+{
+    uint32_t n = 0;
+    while (*a && n + 1u < sizeof app.msg)
+        app.msg[n++] = *a++;
+    if (slot >= 0 && n + 1u < sizeof app.msg)
+        app.msg[n++] = (char)('1' + slot);
+    while (b && *b && n + 1u < sizeof app.msg)
+        app.msg[n++] = *b++;
+    app.msg[n] = 0;
+}
+
+static void app_project_reset(void)  /* another project: the views from its start */
+{
+    app.cursor = app.top = 0;
+    app.otop = 0;
+    app.edit.what = VT_EDIT_NONE;
+    app.ins = VT_NO_INS;
+    app_redraw();
+}
+
+/* > saves to the slot (over a saved project: asked first, > again), < loads it (asked first, < again), shift + <
+ * starts a new project (asked first, shift + < again) */
+static void app_project_button(int32_t dir, uint32_t shift)
+{
+    uint32_t want = dir > 0 ? VT_ASK_SAVE : shift ? VT_ASK_NEW : VT_ASK_LOAD;
+    int rc;
+    if (dir > 0 && shift) {
+        app.ask = VT_ASK_NONE;
+        return;
+    }
+    if (want == VT_ASK_LOAD && !store_used(app.slot)) {
+        app.ask = VT_ASK_NONE;
+        app_say("SLOT ", app.slot, " IS EMPTY");
+        return;
+    }
+    if (app.ask != want && (want != VT_ASK_SAVE || store_used(app.slot))) {
+        app.ask = (uint8_t)want;
+        if (want == VT_ASK_SAVE)
+            app_say("SAVE OVER SLOT ", app.slot, "? > AGAIN");
+        else if (want == VT_ASK_LOAD)
+            app_say("LOAD SLOT ", app.slot, "? < AGAIN");
+        else
+            app_say("NEW PROJECT? SHIFT < AGAIN", -1, 0);
+        return;
+    }
+    app.ask = VT_ASK_NONE;
+    if (want == VT_ASK_SAVE) {
+        rc = store_save(app.slot);
+        if (rc == STORE_OK)
+            app_say("SAVED TO SLOT ", app.slot, 0);
+        else
+            app_say(rc == STORE_FULL ? "NOT SAVED: MEMORY FULL" : "NOT SAVED: FLASH ERROR", -1, 0);
+        return;
+    }
+    player_stop();
+    if (want == VT_ASK_NEW) {
+        store_new();
+        app_project_reset();
+        app_say("NEW PROJECT", -1, 0);
+        return;
+    }
+    rc = store_load(app.slot);
+    if (rc == STORE_OK) {
+        app_project_reset();
+        app_say("LOADED SLOT ", app.slot, 0);
+    } else {
+        app_say("SLOT ", app.slot, " UNREADABLE");
+    }
+}
+
+static void app_project_edit(uint32_t e, int32_t steps, uint32_t shift)   /* an encoder turned in the project view */
+{
+    app.ask = VT_ASK_NONE;
+    if (e == VT_ENC_CURSOR) {            /* K2: the slot */
+        app.slot = (uint8_t)app_clamp((int32_t)app.slot + steps, 0, STORE_SLOTS - 1);
+        app.msg[0] = 0;
+    }
+    if (e == VT_ENC_NAME && shift)       /* shift + K4: the name's cursor; K4: its character */
+        app.pname_pos = (uint8_t)app_clamp((int32_t)app.pname_pos + steps, 0, PROJECT_NAME - 2);
+    if (e == VT_ENC_NAME && !shift) {
+        char name[PROJECT_NAME];
+        app_name_turn(name, project_name(), app.pname_pos, steps);
+        project_set_name(name);
+    }
+}
+
 /* a pad newly hit: the cursor to its row of the page (past the end: nothing); in instrument mode its instrument
  * selected (one of another chip or a free slot: nothing); in the editor that instrument edited; in the order list
  * the cursor to its entry of the page (past the end: nothing) */
@@ -554,6 +675,9 @@ static void app_pads(void)
             continue;
         if (app.view == VT_VIEW_EDITOR) {
             app_editor_pad(p, shift);
+        } else if (app.view == VT_VIEW_PROJECT) {
+            if (p < STORE_SLOTS)
+                app.slot = (uint8_t)p, app.ask = VT_ASK_NONE, app.msg[0] = 0;
         } else if (app.view == VT_VIEW_ORDER) {
             if (app_opage() + p < project_orders())
                 app_entry((int32_t)(app_opage() + p));
@@ -609,6 +733,16 @@ static void app_input(void)          /* take every input event */
         app_view(VT_VIEW_PATTERN);
     if (pressed >> SMK_BTN_ARP & 1u)
         app_view(VT_VIEW_ORDER);
+    if (pressed >> SMK_BTN_GLOBE & 1u)
+        app_view(VT_VIEW_PROJECT);
+    if (app.view == VT_VIEW_PROJECT && pressed &
+                                          ~(1u << SMK_BTN_LEFT | 1u << SMK_BTN_RIGHT | 1u << SMK_BTN_GLOBE |
+                                            1u << SMK_BTN_KNOB_BANK))
+        app.ask = VT_ASK_NONE;           /* (any other button but shift: the question is off) */
+    if (app.view == VT_VIEW_PROJECT && pressed >> SMK_BTN_LEFT & 1u)
+        app_project_button(-1, shift);
+    if (app.view == VT_VIEW_PROJECT && pressed >> SMK_BTN_RIGHT & 1u)
+        app_project_button(1, shift);
     if (app.view == VT_VIEW_ORDER && pressed >> SMK_BTN_LEFT & 1u)
         app_order_button(-1, shift);
     if (app.view == VT_VIEW_ORDER && pressed >> SMK_BTN_RIGHT & 1u)
@@ -632,6 +766,12 @@ static void app_input(void)          /* take every input event */
             continue;
         if (app.view == VT_VIEW_EDITOR) {
             app_editor_edit(e, s, shift);
+            continue;
+        }
+        if (app.view == VT_VIEW_PROJECT) {
+            app_project_edit(e, s, shift);
+            if (e == VT_ENC_TRACK)
+                app_track(s);
             continue;
         }
         if (app.view == VT_VIEW_ORDER) {
@@ -1008,13 +1148,84 @@ static void app_order_draw(void)     /* the order list: the header if it changed
     }
 }
 
+static uint32_t app_project_key(void)   /* what the project view shows, as one word (never 0) */
+{
+    uint32_t h = 1u + app.slot + 4u * app.pname_pos + 64u * app.ask + 256u * store_percent(), i, k;
+    const char *n = project_name();
+    for (i = 0; n[i]; i++)
+        h = h * 31u + (uint8_t)n[i];
+    for (i = 0; app.msg[i]; i++)
+        h = h * 31u + (uint8_t)app.msg[i];
+    for (k = 0; k < STORE_SLOTS; k++)
+        for (i = 0, n = store_name(k), h = h * 31u + 7u; n[i]; i++)
+            h = h * 31u + (uint8_t)n[i];
+    h = h * 31u + (uint32_t)store_autosave_full();
+    return h | 1u;
+}
+
+/* the project view: the header (PROJECT, the name with its cursor; the memory's fullness, its bar), the four slots
+ * (the selected one with the cursor's bar), the message, the help */
+static void app_project_draw(void)
+{
+    char s[24];
+    uint32_t i, pct = store_percent();
+    int32_t x;
+    if (app.head == app_project_key())
+        return;
+    app.head = app_project_key();
+    cv_begin(240, VT_HEAD_H, VT_C_HEAD);
+    x = cv_text(8, 1, &AF_S, "PROJECT", VT_C_TEXT) + 10;
+    cv_text_mono(x, 1, &AF_S, project_name(), VT_C_INS, VT_C_HEAD, VT_PITCH);
+    cv_rect(x + app.pname_pos * VT_PITCH, 14, VT_PITCH - 1, 1, VT_C_INS);
+    memcpy(s, "MEMORY ", 7);
+    i = 7;
+    if (pct >= 100u)
+        s[i++] = '1';
+    if (pct >= 10u)
+        s[i++] = (char)('0' + pct / 10u % 10u);
+    s[i++] = (char)('0' + pct % 10u);
+    s[i++] = '%';
+    s[i] = 0;
+    cv_text_r(232, 1, &AF_S, s, VT_C_HEAD_DIM, VT_C_HEAD);
+    cv_rect(8, 20, 224, 5, VT_C_GRAPH);
+    cv_rect(8, 20, (int32_t)(224u * pct / 100u), 5, pct >= 90u ? VT_C_FULL : VT_C_BAR);
+    cv_blit(0, 0);
+    for (i = 0; i < STORE_SLOTS; i++) {
+        const char *n = store_used(i) ? store_name(i) : "EMPTY";
+        uint32_t k = 0;
+        s[k++] = (char)('1' + i);
+        s[k++] = ' ';
+        while (*n && k + 1u < sizeof s)
+            s[k++] = *n++;
+        s[k] = 0;
+        cv_begin(240, VT_ROW_H, i == app.slot ? VT_C_CURSOR : VT_C_BG);
+        cv_text(8, 0, &AF_S, s, store_used(i) ? VT_C_TEXT : VT_C_EMPTY);
+        cv_blit(0, VT_P_SLOT_Y + i * VT_ROW_H);
+    }
+    cv_begin(240, VT_ROW_H, VT_C_BG);
+    if (app.msg[0])
+        cv_text(8, 0, &AF_S, app.msg, VT_C_EFFECT);
+    else if (store_autosave_full())
+        cv_text(8, 0, &AF_S, "AUTOSAVE: MEMORY FULL", VT_C_FULL);
+    cv_blit(0, VT_P_MSG_Y);
+    cv_begin(240, 2u * VT_ROW_H, VT_C_BG);
+    cv_text(8, 0, &AF_S, "> SAVE   < LOAD   SHIFT < NEW", VT_C_HEAD_DIM);
+    cv_text(8, (int32_t)VT_ROW_H, &AF_S, "K2 SLOT   K4 NAME", VT_C_HEAD_DIM);
+    cv_blit(0, VT_P_HELP_Y);
+}
+
 /* the pads: the rows of the page, the instruments, or the order list's entries; SEQ PLAY, SEQ REC, NOTE REPEAT */
 static void app_leds(void)
 {
     uint32_t p, page = app_page(), playing = app_entry_playing(), prow = player_row(), opage = app_opage();
     for (p = 0; p < SMK_NPAD; p++) {
         uint32_t row = page + p, e = opage + p;
-        const uint8_t *c = app.view == VT_VIEW_ORDER
+        const uint8_t *c = app.view == VT_VIEW_PROJECT
+                               ? (p >= STORE_SLOTS   ? VT_PAD_PAST
+                                  : p == app.slot    ? VT_PAD_CURSOR
+                                  : store_used(p)    ? VT_PAD_NOTE
+                                                     : VT_PAD_EMPTY)
+                           : app.view == VT_VIEW_ORDER
                                ? (e >= project_orders()                          ? VT_PAD_PAST
                                   : player_playing() && e == player_entry() ? VT_PAD_PLAYING
                                   : e == project_entry()                         ? VT_PAD_CURSOR
@@ -1033,6 +1244,7 @@ static void app_leds(void)
     fm1_led_key(SMK_BTN_NOTE_REPEAT, app.pad_ins);
     fm1_led_key(SMK_BTN_PATCH, app.view == VT_VIEW_EDITOR);
     fm1_led_key(SMK_BTN_ARP, app.view == VT_VIEW_ORDER);
+    fm1_led_key(SMK_BTN_GLOBE, app.view == VT_VIEW_PROJECT);
 }
 
 static void app_frame(void)
@@ -1042,9 +1254,12 @@ static void app_frame(void)
         app_editor_draw();
     else if (app.view == VT_VIEW_ORDER)
         app_order_draw();
+    else if (app.view == VT_VIEW_PROJECT)
+        app_project_draw();
     else
         app_draw();
     app_leds();
+    store_service(fm1_ms, player_playing() || fm1_in.keys != 0);   /* (an erase would cut the notes off) */
 }
 
 static void app_idle(void) {}

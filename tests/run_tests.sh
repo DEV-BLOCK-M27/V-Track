@@ -7,8 +7,9 @@
 # DEVICE (seam A, tests/vt_sim.h): the firmware (firmware/src/vtrack.c) on a simulated SMK-37: input events and
 #                   elapsed time in; audio, the screen, the pad and button LEDs, MIDI out and the flash store out.
 #                   tests/vt_shell_test.c: the app shell (starts into the pattern view, silent, button LEDs dark,
-#                   no flash written); the screen in build/host/shell.ppm. tests/vt_note_test.c: a key plays track 1,
-#                   NES Pulse 1, at the 2A03's pitch, one note at a time; a held C4 in build/host/note.wav.
+#                   only the store tag written); the screen in build/host/shell.ppm. tests/vt_note_test.c: a key
+#                   plays track 1, NES Pulse 1, at the 2A03's pitch, one note at a time; a held C4 in
+#                   build/host/note.wav.
 #                   tests/vt_tracks_test.c: K3 selects tracks 1 to 4 (NES Pulse 1, Pulse 2, Triangle, Noise), the
 #                   screen names each, the keys play each; track 3's screen in build/host/tracks.ppm.
 #                   tests/vt_pattern_test.c: step entry with REC (notes, cut, release), looped playback on all four
@@ -31,12 +32,17 @@
 #                   tests/vt_record_test.c: editing and recording (clear, insert and delete a row, copy and paste a
 #                   pattern, one level of undo, cut and release by shift + key, velocity into the volume column and
 #                   its switch, real-time recording into the rows playing); the screen in build/host/record.ppm.
+#                   tests/vt_project_test.c: saving projects (GLOBE: four slots, save, load, a new project, the
+#                   memory's fullness; save, power cycle, load plays and shows the same; the autosave after a power
+#                   cut; another firmware's store cleared on first boot; a project too big refused, the slot kept;
+#                   the stored format's version, chip and channel per track); the screen in build/host/project.ppm.
 # NES chip core (seam B, tests/nes_test.c): register states in, samples out: duty waveforms, period -> frequency,
 #                   the triangle's staircase, the noise's periods and LFSR modes, the 2A03 mixer, no aliasing on
 #                   high notes.
-# Storage (tests/storage_test.c): A/B objects, torn writes. SMK flash map (tests/smk_flash_test.c): the allow-lists
-#                   never reach the protected ranges (head, BTIF / USRTRIM, USR, key_mac); the store owner tag
-#                   (tests/smk_owner_test.c).
+# Storage (tests/storage_test.c): the pool of objects in parts, a power loss at any byte, the room, erasing ahead.
+#                   SMK flash map (tests/smk_flash_test.c): the allow-lists never reach the protected ranges (head,
+#                   BTIF / USRTRIM, USR, key_mac); V-Track's store (its tag, its pool) in FL_DATA; the store owner tag
+#                   VTRACK (tests/smk_owner_test.c).
 # USB (tests/usb_desc_test.c, tests/uac_test.c): the descriptor layouts, the USB audio ring, packets and resampler.
 # Update path: the M-UPGRADE entry (tests/ota_test.c), the update loader (tests/ldr_test.c), the package layout
 #                   (tests/smk_pkg_test.py), the installer CLI (tests/install_test.py).
@@ -57,8 +63,8 @@ PKG=build/felucca-smk37.fwsc
 fail=0
 run() { echo "== $1"; shift; "$@" || fail=1; }
 
-$CC -o "$OUT/storage_test" tests/storage_test.c
-run "flash storage (A/B, torn writes)" "$OUT/storage_test"
+$CC -DBOARD_SMK37=1 -Ifirmware/hal -o "$OUT/storage_test" tests/storage_test.c
+run "flash storage: the pool of objects, parts, a power loss at any byte, the room, erasing ahead" "$OUT/storage_test"
 
 $CC -o "$OUT/input_test" tests/input_test.c
 run "FM-1 keys and buttons (hal/fm1_input.h): fast press, long release, bouncy contacts, glitches, encoders" "$OUT/input_test"
@@ -93,9 +99,9 @@ done
 
 # the SMK-37 flash map, the store owner tag
 $CC -DBOARD_SMK37=1 -Ifirmware/hal -o "$OUT/smk_flash_test" tests/smk_flash_test.c
-run "SMK-37 flash map: allow-lists never reach the head, BTIF/USRTRIM, USR, key_mac; store layout" "$OUT/smk_flash_test"
+run "SMK-37 flash map: allow-lists never reach the head, BTIF/USRTRIM, USR, key_mac; V-Track's store in FL_DATA" "$OUT/smk_flash_test"
 $CC -DBOARD_SMK37=1 -Ifirmware/hal -o "$OUT/smk_owner_test" tests/smk_owner_test.c
-run "SMK-37 store owner tag: another firmware's store cleared, ours kept, nothing else written" "$OUT/smk_owner_test"
+run "SMK-37 store owner tag VTRACK: another family's store cleared, never read; ours kept; nothing else written" "$OUT/smk_owner_test"
 
 [ -f "$PKG" ] && [ -f build/gen/ui_fonts.h ] || { echo "run ./build.sh first"; exit 1; }
 
@@ -122,7 +128,7 @@ run "update loader, SMK-37 Pro: app area 0x4000-0x9CFFF, protected ranges untouc
 # seam A: the device on the simulated SMK-37
 VT="-Ibuild/gen -Ifirmware/src -Ifirmware/hal -Itests"
 $CC $VT -o "$OUT/vt_shell_test" tests/vt_shell_test.c
-run "DEVICE: the app shell boots into the pattern view; silence, dark button LEDs, no flash written" \
+run "DEVICE: the app shell boots into the pattern view; silence, dark button LEDs, the store tag only" \
     "$OUT/vt_shell_test" "$OUT"
 $CC $VT -o "$OUT/vt_note_test" tests/vt_note_test.c -lm
 run "DEVICE: a key plays track 1 (NES Pulse 1) at the 2A03's pitch while held, one note at a time" \
@@ -151,6 +157,9 @@ run "DEVICE: the order list (add, duplicate, delete, move), song playback, patte
 $CC $VT -o "$OUT/vt_record_test" tests/vt_record_test.c
 run "DEVICE: editing (clear, insert, delete, copy, paste, undo) and recording (velocity, real time)" \
     "$OUT/vt_record_test" "$OUT"
+$CC $VT -o "$OUT/vt_project_test" tests/vt_project_test.c
+run "DEVICE: projects (GLOBE): four slots, save, load, new, autosave, another family cleared, too big refused" \
+    "$OUT/vt_project_test" "$OUT"
 
 # seam B: the NES chip core alone
 $CC -o "$OUT/nes_test" tests/nes_test.c -lm
@@ -189,7 +198,7 @@ else
     run "ASan/UBSan: update loader, SMK-37 Pro" "$A/ldr_test" "$OUT/smk_old.fwsc" "$OUT/smk_new.fwsc"
     $SCC -DBOARD_SMK37=1 -DOWN_PKG=1 -o "$A/ota_test" tests/ota_test.c
     run "ASan/UBSan: M-UPGRADE entry, SMK-37 Pro" "$A/ota_test" "$PKG"
-    $SCC -o "$A/storage_test" tests/storage_test.c
+    $SCC -DBOARD_SMK37=1 -Ifirmware/hal -o "$A/storage_test" tests/storage_test.c
     run "ASan/UBSan: flash storage" "$A/storage_test"
     $SCC -DBOARD_SMK37=1 -Ifirmware/hal -o "$A/smk_owner_test" tests/smk_owner_test.c
     run "ASan/UBSan: SMK-37 store owner tag" "$A/smk_owner_test"
@@ -213,6 +222,8 @@ else
     run "ASan/UBSan: DEVICE, the order list and song playback" "$A/vt_order_test"
     $SCC $VT -o "$A/vt_record_test" tests/vt_record_test.c
     run "ASan/UBSan: DEVICE, editing and recording" "$A/vt_record_test"
+    $SCC $VT -o "$A/vt_project_test" tests/vt_project_test.c
+    run "ASan/UBSan: DEVICE, saving projects" "$A/vt_project_test"
     $SCC -o "$A/nes_test" tests/nes_test.c -lm
     run "ASan/UBSan: NES chip core" "$A/nes_test"
 fi

@@ -32,6 +32,14 @@ _Avoid_: part, lane
 One piece of music: the chip and channel of each track, its instruments, its patterns and its order list.
 _Avoid_: song (when the whole piece is meant), session
 
+**Slot** (Speicherplatz):
+One of the four places in the project memory a project is saved to and loaded from.
+_Avoid_: bank, file, preset
+
+**Autosave**:
+The copy of the current project the device keeps by itself, a few seconds after each change, and loads at power-on.
+_Avoid_: backup, snapshot
+
 **Pattern**:
 A numbered list of rows for one track, 16 to 64 rows long.
 _Avoid_: phrase, clip, sequence

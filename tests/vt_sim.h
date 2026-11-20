@@ -14,6 +14,8 @@
  * A test includes this file, then drives the device only through the sim_* functions below and observes only
  * what they return: what a player would see, hear and keep.
  *   sim_power_on()            power on (the flash as it is: erased at first) up to the app's first screen
+ *   sim_power_off()           power cut: the device stops where it is (sim_power_on starts it again, its RAM lost)
+ *   sim_flash_set(off, p, n)  before power on: the flash as another firmware left it (n bytes from off)
  *   sim_run_ms(ms)            time passes
  *   sim_key(k, vel)           keybed key 0..36 (0 = C3) down with velocity 1..127, or up (vel 0)
  *   sim_pad(p, vel)           pad 0..15 (0..7 the top row, left to right) hit with velocity 1..127, or released (0)
@@ -287,6 +289,22 @@ static void sim_power_on(void)
     vt_boot();
     sim_booted = 1;
     sim_last_frame = fm1_ms - 15u;
+}
+static void sim_power_off(void)
+{
+    sim_booted = 0;
+    sim_audio_on = 0;
+    memset((void *)&project_pat, 0x5A, sizeof project_pat);   /* the RAM's content gone: the project with it */
+    memset((void *)&project, 0x5A, sizeof project);
+}
+static void sim_flash_set(uint32_t off, const void *p, uint32_t n)
+{
+    if (!sim_nor_init) {
+        memset(sim_nor, 0xFF, sizeof sim_nor);
+        sim_nor_init = 1;
+    }
+    if (off < SIM_FLASH_SIZE && n <= SIM_FLASH_SIZE - off)
+        memcpy(sim_nor + off, p, n);
 }
 static void sim_run_ms(uint32_t ms)
 {

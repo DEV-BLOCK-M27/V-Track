@@ -58,6 +58,32 @@
  *                                       or release point past it: none)
  *   project_set_loop(i, s, k), project_set_release(i, s, k)   its loop / release point: a step within its length
  *                                       or PROJECT_SEQ_NONE (anything else is refused)
+ *   project_name(), project_set_name(name)   the project's name: up to 7 characters, trailing spaces dropped ("NEW"
+ *                                       for a new project)
+ *   project_track_chip(t), project_track_channel(t)   the chip and channel track 0..3 plays (ADR 0002; so far NES,
+ *                                       channel = track: PLAYER_PULSE1 ..)
+ *   project_track_volume(t), project_set_track_volume(t, v)   the mix: track t's volume 0..127 (127 at first), and
+ *   project_track_mute(t), project_set_track_mute(t, on)      its mute (the faders, #12)
+ *   project_save(b, max)                the project in the stored format (below) into b: its length, 0 if it does not
+ *                                       fit in max (PROJECT_STORE_MAX always fits)
+ *   project_stored_name(b, n, name)     the name of stored project b (n bytes) into name[PROJECT_NAME]: 1; 0 if b is
+ *                                       not in a format version this one reads
+ *   project_load(b, n)                  the stored project b (n bytes) becomes the project: 1; 0 if it is not one this
+ *                                       version can read (another format version, a value out of range, a chip or
+ *                                       channel the player has not got): the project stays as it was. The player
+ *                                       should be stopped; the undo step is gone, the copied pattern stays
+ * The stored format, version 1 (PROJECT_FORMAT), little-endian:
+ *   'V' 'T' version                     the format and its version
+ *   name[8]                             the project's name, zero-padded
+ *   bpm u16
+ *   4 x { chip, channel, volume, mute } each track (ADR 0002: chip and channel from the first release)
+ *   orders, entry, orders x 4 patterns  the order list, the current entry
+ *   n, n x { index, chip, name[8], 4 x { len, loop, release, v[len] } }   the instruments in use (the free slots
+ *                                       not stored)
+ *   n u16, n x { track, pattern, rows, k, k x { row, mask, fields } }   the patterns that hold a row or have another
+ *                                       length than a new one's; only the rows that hold a field (empty rows are not
+ *                                       stored), mask bit 0 note, 1 instrument, 2 volume, 3 effect (u16), the
+ *                                       fields in that order
  * An NES instrument's sequences: volume 0..15, arpeggio (semitones added to the note), pitch (added to the period
  * each frame: + lower), duty 0..3 (a pulse) or mode 0..1 (the noise). A new project has the factory instruments 00
  * LEAD, 01 BASS, 02 KICK (the triangle), 03 SNARE and 04 HAT (the noise); 05 to 0F are free.
@@ -98,6 +124,12 @@
 #define PROJECT_SEQ_STEPS 64u
 #define PROJECT_SEQ_NONE 0xFFu           /* no loop / release point */
 #define PROJECT_NAME 8u                  /* an instrument's name: up to 7 characters */
+#define PROJECT_FORMAT 1u                /* the stored format's version */
+#define PROJECT_VOLUME_MAX 127u          /* a track's volume in the mix */
+/* the stored format's length at most: every instrument and every row of every pattern with all its fields */
+#define PROJECT_STORE_MAX (3u + PROJECT_NAME + 2u + 4u * PROJECT_TRACKS + 2u + 4u * PROJECT_ORDERS + 1u +           \
+                           PROJECT_INSTRUMENTS * (2u + PROJECT_NAME + PROJECT_SEQS * (3u + PROJECT_SEQ_STEPS)) + 2u + \
+                           PROJECT_TRACKS * PROJECT_PATTERNS * (4u + PROJECT_ROWS * 7u))
 
 #define PROJECT_ORDER() __asm__ volatile("" ::: "memory")   /* the stores before it land before those after (the
                                                             * player in the audio ISR relies on the order) */
@@ -130,6 +162,9 @@ static struct {
     volatile uint8_t orders;             /* its entries, 1 .. PROJECT_ORDERS */
     volatile uint8_t entry;              /* the current entry, 0 .. orders - 1 */
     volatile uint16_t bpm;
+    char name[PROJECT_NAME];
+    uint8_t chip[PROJECT_TRACKS], channel[PROJECT_TRACKS];   /* each track's (ADR 0002) */
+    uint8_t volume[PROJECT_TRACKS], mute[PROJECT_TRACKS];    /* the mix */
 } project;
 
 typedef struct {                         /* one pattern's rows: the undo step, the copied pattern */
@@ -147,19 +182,24 @@ static uint32_t project_ins_chip(uint32_t i)
 
 static const char *project_ins_name(uint32_t i) { return i < PROJECT_INSTRUMENTS ? project_pat.ins_def[i].name : ""; }
 
-static void project_set_ins_name(uint32_t i, const char *name)
+static void project_name_copy(char *d, const char *name)   /* up to 7 characters, trailing spaces dropped */
 {
-    char *d;
     uint32_t k;
-    if (i >= PROJECT_INSTRUMENTS)
-        return;
-    d = project_pat.ins_def[i].name;
     for (k = 0; k + 1u < PROJECT_NAME && name[k]; k++)
         d[k] = name[k];
     for (; k < PROJECT_NAME; k++)
         d[k] = 0;
     for (k = PROJECT_NAME - 1u; k-- > 0 && d[k] == ' ';)
         d[k] = 0;
+}
+
+static const char *project_name(void) { return project.name; }
+static void project_set_name(const char *name) { project_name_copy(project.name, name); }
+
+static void project_set_ins_name(uint32_t i, const char *name)
+{
+    if (i < PROJECT_INSTRUMENTS)
+        project_name_copy(project_pat.ins_def[i].name, name);
 }
 
 static void project_ins_new(uint32_t i, uint32_t chip, const char *name)
@@ -295,6 +335,13 @@ static void project_init(void)
     project.orders = 1;
     project.entry = 0;
     project.bpm = 120;
+    project_set_name("NEW");
+    for (t = 0; t < PROJECT_TRACKS; t++) {
+        project.chip[t] = PROJECT_CHIP_NES;
+        project.channel[t] = (uint8_t)t;
+        project.volume[t] = PROJECT_VOLUME_MAX;
+        project.mute[t] = 0;
+    }
     project_undo_snap.valid = 0;         /* (the copied pattern stays: it can go into another project) */
 }
 
@@ -577,4 +624,288 @@ static void project_set_bpm(int32_t bpm)
     project.bpm = (uint16_t)(bpm < (int32_t)PROJECT_BPM_MIN   ? PROJECT_BPM_MIN
                              : bpm > (int32_t)PROJECT_BPM_MAX ? PROJECT_BPM_MAX
                                                               : (uint32_t)bpm);
+}
+
+/* --- the tracks, the mix --- */
+
+static uint32_t project_track_chip(uint32_t t) { return t < PROJECT_TRACKS ? project.chip[t] : PROJECT_CHIP_NONE; }
+static uint32_t project_track_channel(uint32_t t) { return t < PROJECT_TRACKS ? project.channel[t] : 0u; }
+static uint32_t project_track_volume(uint32_t t) { return t < PROJECT_TRACKS ? project.volume[t] : 0u; }
+static uint32_t project_track_mute(uint32_t t) { return t < PROJECT_TRACKS ? project.mute[t] : 0u; }
+static void project_set_track_volume(uint32_t t, int32_t v)
+{
+    if (t < PROJECT_TRACKS)
+        project.volume[t] = (uint8_t)project_clamp(v, PROJECT_VOLUME_MAX + 1u);
+}
+static void project_set_track_mute(uint32_t t, uint32_t on)
+{
+    if (t < PROJECT_TRACKS)
+        project.mute[t] = (uint8_t)(on != 0);
+}
+
+/* --- the stored format --- */
+
+typedef struct {
+    uint8_t *b;
+    const uint8_t *r;
+    uint32_t n, at, bad;
+} project_io_t;
+
+static void project_put(project_io_t *o, uint32_t v)   /* a byte out */
+{
+    if (o->at < o->n)
+        o->b[o->at] = (uint8_t)v;
+    else
+        o->bad = 1;
+    o->at++;
+}
+static void project_put16(project_io_t *o, uint32_t v) { project_put(o, v & 0xFFu); project_put(o, v >> 8 & 0xFFu); }
+static void project_put_name(project_io_t *o, const char *name)
+{
+    uint32_t k;
+    for (k = 0; k < PROJECT_NAME; k++)
+        project_put(o, (uint8_t)name[k]);
+}
+
+static uint32_t project_row_mask(uint32_t t, uint32_t p, uint32_t r)
+{
+    return (project_pat.note[t][p][r] ? 1u : 0u) | (project_pat.ins[t][p][r] ? 2u : 0u) |
+           (project_pat.vol[t][p][r] ? 4u : 0u) | (project_pat.effect[t][p][r] ? 8u : 0u);
+}
+
+static uint32_t project_save(uint8_t *b, uint32_t max)
+{
+    project_io_t o = {b, 0, max, 0, 0};
+    uint32_t t, p, r, i, s, k, n = 0, at;
+    project_put(&o, 'V');
+    project_put(&o, 'T');
+    project_put(&o, PROJECT_FORMAT);
+    project_put_name(&o, project.name);
+    project_put16(&o, project.bpm);
+    for (t = 0; t < PROJECT_TRACKS; t++) {
+        project_put(&o, project.chip[t]);
+        project_put(&o, project.channel[t]);
+        project_put(&o, project.volume[t]);
+        project_put(&o, project.mute[t]);
+    }
+    project_put(&o, project.orders);
+    project_put(&o, project.entry);
+    for (i = 0; i < project.orders; i++)
+        for (t = 0; t < PROJECT_TRACKS; t++)
+            project_put(&o, project.order[i][t]);
+    for (i = 0; i < PROJECT_INSTRUMENTS; i++)
+        n += project_ins_chip(i) != PROJECT_CHIP_NONE;
+    project_put(&o, n);
+    for (i = 0; i < PROJECT_INSTRUMENTS; i++) {
+        const project_ins_t *d = &project_pat.ins_def[i];
+        if (d->chip == PROJECT_CHIP_NONE)
+            continue;
+        project_put(&o, i);
+        project_put(&o, d->chip);
+        project_put_name(&o, d->name);
+        for (s = 0; s < PROJECT_SEQS; s++) {
+            project_put(&o, d->seq[s].len);
+            project_put(&o, d->seq[s].loop);
+            project_put(&o, d->seq[s].release);
+            for (k = 0; k < d->seq[s].len; k++)
+                project_put(&o, (uint8_t)d->seq[s].v[k]);
+        }
+    }
+    at = o.at;                           /* the patterns' count, filled in after them */
+    project_put16(&o, 0);
+    for (n = 0, t = 0; t < PROJECT_TRACKS; t++)
+        for (p = 0; p < PROJECT_PATTERNS; p++) {
+            for (k = 0, r = 0; r < PROJECT_ROWS; r++)
+                k += project_row_mask(t, p, r) != 0;
+            if (!k && project_pat.rows[t][p] == PROJECT_ROWS_NEW)
+                continue;
+            n++;
+            project_put(&o, t);
+            project_put(&o, p);
+            project_put(&o, project_pat.rows[t][p]);
+            project_put(&o, k);
+            for (r = 0; r < PROJECT_ROWS; r++) {
+                uint32_t m = project_row_mask(t, p, r);
+                if (!m)
+                    continue;
+                project_put(&o, r);
+                project_put(&o, m);
+                if (m & 1u)
+                    project_put(&o, project_pat.note[t][p][r]);
+                if (m & 2u)
+                    project_put(&o, project_pat.ins[t][p][r]);
+                if (m & 4u)
+                    project_put(&o, project_pat.vol[t][p][r]);
+                if (m & 8u)
+                    project_put16(&o, project_pat.effect[t][p][r]);
+            }
+        }
+    if (at + 2u <= max) {
+        b[at] = (uint8_t)n;
+        b[at + 1u] = (uint8_t)(n >> 8);
+    }
+    return o.bad ? 0u : o.at;
+}
+
+static uint32_t project_get(project_io_t *o)   /* a byte in (past the end: 0, and it is bad) */
+{
+    if (o->at >= o->n) {
+        o->bad = 1;
+        return 0;
+    }
+    return o->r[o->at++];
+}
+static uint32_t project_get16(project_io_t *o)
+{
+    uint32_t v = project_get(o);
+    return v | project_get(o) << 8;
+}
+static void project_get_name(project_io_t *o, char *d)   /* (d: 0 skips it) */
+{
+    char name[PROJECT_NAME];
+    uint32_t k;
+    for (k = 0; k < PROJECT_NAME; k++)
+        name[k] = (char)project_get(o);
+    name[PROJECT_NAME - 1u] = 0;
+    if (d)
+        project_name_copy(d, name);
+}
+static int project_field_ok(uint32_t f, uint32_t v)   /* a stored field: not empty, within its values */
+{
+    return f == PROJECT_F_NOTE   ? PROJECT_IS_NOTE(v) || v == PROJECT_CUT || v == PROJECT_RELEASE
+           : f == PROJECT_F_EFFECT ? project_effect_ok(v)
+                                   : v >= 1u && v <= 16u;
+}
+
+/* one pass over the stored project: apply 0 checks it, apply 1 (after a check) makes it the project */
+static int project_load_pass(const uint8_t *b, uint32_t len, int apply)
+{
+    project_io_t o = {0, b, len, 0, 0};
+    uint32_t t, i, s, k, n, used = 0, v;
+    if (project_get(&o) != 'V' || project_get(&o) != 'T' || project_get(&o) != PROJECT_FORMAT)
+        return 0;
+    if (apply) {                         /* every instrument free, every pattern empty and new */
+        uint32_t p, r;
+        for (i = 0; i < PROJECT_INSTRUMENTS; i++)
+            project_ins_new(i, PROJECT_CHIP_NONE, "");
+        for (t = 0; t < PROJECT_TRACKS; t++)
+            for (p = 0; p < PROJECT_PATTERNS; p++) {
+                for (r = 0; r < PROJECT_ROWS; r++) {
+                    project_pat.note[t][p][r] = project_pat.ins[t][p][r] = project_pat.vol[t][p][r] = PROJECT_EMPTY;
+                    project_pat.effect[t][p][r] = PROJECT_EMPTY;
+                }
+                project_pat.rows[t][p] = PROJECT_ROWS_NEW;
+            }
+        project_undo_snap.valid = 0;
+    }
+    project_get_name(&o, apply ? project.name : 0);
+    v = project_get16(&o);
+    if (v < PROJECT_BPM_MIN || v > PROJECT_BPM_MAX)
+        return 0;
+    if (apply)
+        project.bpm = (uint16_t)v;
+    for (t = 0; t < PROJECT_TRACKS; t++) {
+        uint32_t chip = project_get(&o), ch = project_get(&o), vol = project_get(&o), mute = project_get(&o);
+        if (chip != PROJECT_CHIP_NES || ch != t || vol > PROJECT_VOLUME_MAX || mute > 1u)
+            return 0;                    /* (the player has the NES on channel = track only, so far) */
+        if (apply) {
+            project.chip[t] = (uint8_t)chip, project.channel[t] = (uint8_t)ch;
+            project.volume[t] = (uint8_t)vol, project.mute[t] = (uint8_t)mute;
+        }
+    }
+    n = project_get(&o);
+    v = project_get(&o);
+    if (n < 1u || n > PROJECT_ORDERS || v >= n)
+        return 0;
+    for (i = 0; i < n; i++)
+        for (t = 0; t < PROJECT_TRACKS; t++) {
+            uint32_t p = project_get(&o);
+            if (p >= PROJECT_PATTERNS)
+                return 0;
+            if (apply)
+                project.order[i][t] = (uint8_t)p;
+        }
+    if (apply)
+        project.orders = (uint8_t)n, project.entry = (uint8_t)v;
+    n = project_get(&o);
+    if (n > PROJECT_INSTRUMENTS)
+        return 0;
+    while (n--) {
+        project_ins_t *d;
+        i = project_get(&o);
+        if (i >= PROJECT_INSTRUMENTS || (used >> i & 1u) || project_get(&o) != PROJECT_CHIP_NES)
+            return 0;
+        used |= 1u << i;
+        d = &project_pat.ins_def[i];
+        project_get_name(&o, apply ? d->name : 0);
+        for (s = 0; s < PROJECT_SEQS; s++) {
+            uint32_t l = project_get(&o), loop = project_get(&o), rel = project_get(&o);
+            if (l > PROJECT_SEQ_STEPS || (loop != PROJECT_SEQ_NONE && loop >= l) ||
+                (rel != PROJECT_SEQ_NONE && rel >= l))
+                return 0;
+            for (k = 0; k < l; k++) {
+                int32_t x = (int8_t)project_get(&o);
+                if (x < PROJECT_SEQ_MIN[s] || x > PROJECT_SEQ_MAX[s])
+                    return 0;
+                if (apply)
+                    d->seq[s].v[k] = (int8_t)x;
+            }
+            if (apply)
+                d->seq[s].len = (uint8_t)l, d->seq[s].loop = (uint8_t)loop, d->seq[s].release = (uint8_t)rel;
+        }
+        if (apply)
+            d->chip = PROJECT_CHIP_NES;
+    }
+    n = project_get16(&o);
+    if (n > PROJECT_TRACKS * PROJECT_PATTERNS)
+        return 0;
+    while (n--) {
+        uint32_t p, rows;
+        t = project_get(&o);
+        p = project_get(&o);
+        rows = project_get(&o);
+        k = project_get(&o);
+        if (t >= PROJECT_TRACKS || p >= PROJECT_PATTERNS || rows < PROJECT_ROWS_MIN || rows > PROJECT_ROWS ||
+            k > PROJECT_ROWS)
+            return 0;
+        if (apply)
+            project_pat.rows[t][p] = (uint8_t)rows;
+        while (k--) {
+            uint32_t r = project_get(&o), m = project_get(&o), f;
+            if (r >= PROJECT_ROWS || !m || m > 15u)
+                return 0;
+            for (f = 0; f < 4u; f++) {
+                if (!(m >> f & 1u))
+                    continue;
+                v = f == PROJECT_F_EFFECT ? project_get16(&o) : project_get(&o);
+                if (!project_field_ok(f, v))
+                    return 0;
+                if (!apply)
+                    continue;
+                if (f == PROJECT_F_NOTE)
+                    project_pat.note[t][p][r] = (uint8_t)v;
+                else if (f == PROJECT_F_INS)
+                    project_pat.ins[t][p][r] = (uint8_t)v;
+                else if (f == PROJECT_F_VOL)
+                    project_pat.vol[t][p][r] = (uint8_t)v;
+                else
+                    project_pat.effect[t][p][r] = (uint16_t)v;
+            }
+        }
+    }
+    return !o.bad && o.at == len;
+}
+
+static int project_stored_name(const uint8_t *b, uint32_t len, char *name)
+{
+    project_io_t o = {0, b, len, 0, 0};
+    if (project_get(&o) != 'V' || project_get(&o) != 'T' || project_get(&o) != PROJECT_FORMAT)
+        return 0;
+    project_get_name(&o, name);
+    return !o.bad;
+}
+
+static int project_load(const uint8_t *b, uint32_t len)
+{
+    return project_load_pass(b, len, 0) && project_load_pass(b, len, 1);
 }

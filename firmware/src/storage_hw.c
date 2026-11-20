@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: GPL-3.0-only
  * Copyright (C) 2026 Leo Kuroshita (@kurogedelic), Hügelton Instruments */
 /* The firmware side of storage.c (FELUCCA_FLASH): flash reads in short IRQ-off windows so the
- * audio keeps up, erases and writes only inside the storage areas, the audio buffer silenced
- * first. The host tests (storage_test.c) provide their own st_* on a simulated NOR. */
+ * audio keeps up, erases and writes only inside the store window FL_DATA (the sample slots of FL_SMP and the stock
+ * mapping's marker are Felucca's: V-Track never writes there), the audio buffer silenced first. The host tests
+ * (storage_test.c) provide their own st_* on a simulated NOR. */
+#define ST_WINDOW_OK(off, n) FL_IN(off, n, FL_DATA_LO, FL_DATA_HI)
 static uint8_t flash_ok;                 /* JEDEC id matched at boot (main.c flash_boot) */
 static int st_read(uint32_t off, void *dst, uint32_t n)   /* 256-byte IRQ-off windows: audio keeps up */
 {
@@ -25,23 +27,12 @@ static void audio_silence(void)                 /* IRQs off: the DMA would loop 
     for (i = 0; i < sizeof abuf / sizeof abuf[0]; i++)
         abuf[i] = 0;
 }
-#if BOARD_SMK37
-static void st_stock_release(void);             /* storage.c: the stock mapping's end marker */
-static int st_in_usrflash(uint32_t off);
-#endif
 static int st_erase(uint32_t off)
 {
     uint32_t took, f;
     int rc;
-#if BOARD_SMK37
-    if (!FL_STORE_OK(off, 0x1000u) && !FL_STOCKTAG_OK(off, 0x1000u))
+    if (!ST_WINDOW_OK(off, 0x1000u))
         return -8;
-    if (st_in_usrflash(off))
-        st_stock_release();                     /* before the first erase in USRFLASH: see storage.c */
-#else
-    if (!FL_STORE_OK(off, 0x1000u))
-        return -8;
-#endif
     f = irq_save();
     audio_silence();
 #if !BOARD_SMK37                                /* (the SMK-37's LEDs are latched, no scan) */
@@ -53,7 +44,7 @@ static int st_erase(uint32_t off)
 }
 static int st_prog(uint32_t off, const void *src, uint32_t n)
 {
-    if (!FL_STORE_OK(off, n))                   /* only inside the storage areas */
+    if (!ST_WINDOW_OK(off, n))                  /* only inside the store window */
         return -8;
     return fl_write(off, src, n);
 }

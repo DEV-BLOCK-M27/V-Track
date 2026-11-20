@@ -3,8 +3,8 @@
 /* The V-Track app shell on the simulated SMK-37 (seam A, tests/vt_sim.h): it boots through a screen showing the
  * name into the pattern view (track 1's rows, tests/vt_pattern_test.c), silent, the button LEDs dark, the pads
  * showing the rows; a key played (it sounds: tests/vt_note_test.c) leaves the screen and the LEDs as they are; the
- * controls V-Track does not use yet and USB MIDI in change nothing (MIDI in is taken, never refused); the flash is
- * not written.
+ * controls V-Track does not use yet and USB MIDI in change nothing (MIDI in is taken, never refused); the flash
+ * gets the store's owner tag (the first boot) and nothing else: an unchanged project is not autosaved.
  *   tests/vt_shell_test [OUT_DIR]   (OUT_DIR: the screen as shell.ppm) */
 #include "vt_sim.h"
 
@@ -108,7 +108,14 @@ int main(int argc, char **argv)
         check(sim_screen_text("NES \xB7 PULSE 1") && buttons_dark() && pads_kept() && sim_midi_out(pkts, 16) == 0,
               "buttons, knobs, faders, wheels, MIDI: the screen and LEDs as they were, no MIDI out");
     }
-    check(sim_flash_writes() == 0 && sim_flash_refused() == 0, "the flash is not written, nothing refused");
+    {   /* the first boot tags the store (VTRACK, storage.c); the project unchanged: no autosave */
+        uint32_t i, written = 0;
+        for (i = 0; i < SIM_FLASH_SIZE; i++)
+            written += sim_flash()[i] != 0xFFu;
+        check(sim_flash_writes() == 1 && written == 16 && !memcmp(sim_flash() + FL_DATA_LO, "SMK37DATAVTRACK", 16) &&
+                  sim_flash_refused() == 0,
+              "the flash: the store's owner tag only (the first boot), nothing refused");
+    }
 
     if (argc > 1) {
         snprintf(path, sizeof path, "%s/shell.ppm", argv[1]);

@@ -4,8 +4,8 @@
  * every 4 KiB sector of the 1 MiB part through the app's allow-list (FL_RANGE_OK / FL_GUARD, fm1_flash.h),
  * the update loader's (loader.c) and ldr_core.c's record window: none of them may ever reach
  * the head 0x0-0x3FFF, BTIF / USRTRIM 0xC0000-0xC1FFF, USR 0xF4000-0xFDFFF or key_mac 0xFF000-;
- * the store's objects (storage.c), the FM6 voice bank (fm6_vbank.c) and the OTA staging (ota.c) lie
- * inside the allowed windows; ranges that wrap or straddle a boundary are refused. */
+ * V-Track's store (storage.c: the owner tag, every sector of the pool its objects take) lies inside FL_DATA;
+ * ranges that wrap or straddle a boundary are refused. */
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -32,7 +32,7 @@ static int protected_sector(uint32_t s)
 
 int main(void)
 {
-    uint32_t s, o, c, leak_app = 0, leak_ldr = 0, leak_guard = 0, allowed = 0, in_store = 1;
+    uint32_t s, leak_app = 0, leak_ldr = 0, leak_guard = 0, allowed = 0, in_store = 1;
     for (s = 0; s < 0x100000u; s += 0x1000u) {
         if (!protected_sector(s))
             continue;
@@ -61,27 +61,15 @@ int main(void)
     check("loader: app area 0x4000-0x9CFFF, records 0x9D000-0xBFFFF only",
           LDR_RANGE_OK(0x4000u, 0x1000u) && LDR_RANGE_OK(0x9C000u, 0x1000u) && LDR_RANGE_OK(0xBF000u, 0x1000u) &&
           !LDR_RANGE_OK(0xC0000u, 0x1000u) && FL_REC_HI == 0xC0000u);
-    for (o = 0; o < OBJ_COUNT; o++)
-        for (c = 0; c < 2u; c++)
-            in_store &= FL_STORE_OK(st_sector(o, c), 0x1000u) && st_sector(o, c) < FL_DATA_HI;
-    {   /* every object's two copies distinct */
-        uint32_t o2, c2, distinct = 1;
-        for (o = 0; o < OBJ_COUNT; o++)
-            for (c = 0; c < 2u; c++)
-                for (o2 = 0; o2 < OBJ_COUNT; o2++)
-                    for (c2 = 0; c2 < 2u; c2++)
-                        if ((o != o2 || c != c2) && st_sector(o, c) == st_sector(o2, c2) &&
-                            !(c == c2 && (o == OBJ_FM6BANK || o == OBJ_UPFM6) && (o2 == OBJ_FM6BANK || o2 == OBJ_UPFM6)))
-                            distinct = 0;                 /* (the retired FM6 bank and OBJ_UPFM6 share a pair, as on the FM-1) */
-        check("storage.c: every object (A/B) in FL_DATA, no two share a sector", in_store && distinct);
-        for (o = 0, distinct = 1; o < OBJ_COUNT; o++)
-            for (c = 0; c < 2u; c++)
-                distinct &= st_sector(o, c) != ST_SMK_VBANK && st_sector(o, c) < 0xAF000u;
-        check("FM6 voice bank 0xB0000: in FL_DATA, its own sector; objects below the owner tag 0xAF000",
-              distinct && FL_STORE_OK(ST_SMK_VBANK, 0x1000u) && ST_SMK_VBANK == 0xB0000u);
-    }
-    check("storage.c: settings 0xAD000/0xAE000, projects from 0x9D000",
-          st_sector(OBJ_SETTINGS, 0) == 0xAD000u && st_sector(OBJ_SETTINGS, 1) == 0xAE000u && st_sector(OBJ_PROJECT0, 0) == 0x9D000u);
+    for (s = 0; s < ST_POOL; s++)          /* every sector a V-Track object (a slot, the autosave) may take */
+        in_store &= FL_GUARD(st_off(s), 0x1000u) && !FL_PROTECTED(st_off(s), 0x1000u) &&
+                    FL_IN(st_off(s), 0x1000u, FL_DATA_LO, FL_DATA_HI) && FL_GUARD(st_off(s) + 0xF00u, 256u);
+    check("storage.c: every pool sector (the slots, the autosave) in FL_DATA, allowed, unprotected",
+          in_store && ST_POOL == 29u && st_off(0) == 0x9E000u && st_off(ST_POOL - 1u) == 0xBA000u);
+    check("storage.c: the owner tag (VTRACK) in FL_DATA's first sector, apart from the pool",
+          ST_OWNER_OFF == 0x9D000u && FL_GUARD(ST_OWNER_OFF, 0x1000u) && ST_OWNER_OFF < st_off(0));
+    check("storage.c: the objects: four slots and the autosave, a part a sector", ST_OBJECTS == 5u &&
+          ST_PART + ST_HEAD == 0x1000u);
     check("FL_PLAIN_LO = the VM start 0x9D000", FL_PLAIN_LO == 0x9D000u);
     check("FL_JEDEC_OK: the SMK part 0xEB6014 and 0x856014 only", FL_JEDEC_OK(0xEB6014u) && FL_JEDEC_OK(0x856014u) &&
           !FL_JEDEC_OK(0u) && !FL_JEDEC_OK(0xFFFFFFu) && !FL_JEDEC_OK(0xEB6015u));

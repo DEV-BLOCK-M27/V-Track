@@ -23,8 +23,8 @@
 /* ---- SMK-37 Pro flash map (hardware notes: https://github.com/genkigenki/fm1-to-smk37) ----
  *   0x00000-0x03FFF  head (SPL, isd_config)         NEVER
  *   0x04000-0x9CFFF  app area (stock PRCT end)      update loader only (FL_APP)
- *   0x9D000-0xBAFFF  VM: Felucca store (projects, user presets, autosave, FM6 patches, settings,
- *                    owner tag 0xAF000, FM6 voice bank 0xB0000; storage.c)              FL_DATA
+ *   0x9D000-0xBAFFF  VM: the store (V-Track: owner tag VTRACK 0x9D000, the pool of project slots and
+ *                    the autosave 0x9E000-0xBAFFF; storage.c; Felucca kept its store here)       FL_DATA
  *   0xBB000-0xBFFFF  VM: M-UPGRADE loader staging + update record (ota.c)          FL_OTA
  *   0xC0000-0xC0FFF  BTIF (BT pairing)              NEVER
  *   0xC1000-0xC1FFF  USRTRIM (key/pad/wheel calibration, "trimdat")   NEVER
@@ -57,8 +57,9 @@
 #define FL_SMP_HI       0x000EA000u
 /* USRFLASH is the stock firmware's mapping (global settings 0xC2000, 8 presets from 0xC3000) with its end marker
  * "usrdata\0" at 0xEAFF8: while the marker is there the stock firmware trusts the area and never rebuilds it.
- * Before the first write into USRFLASH the marker sector is erased (storage.c st_stock_release), so a return to
- * stock rebuilds the factory mapping. Exactly that one sector, nothing else above FL_SMP_HI. */
+ * Before the first write into USRFLASH the marker sector is erased (Felucca's storage.c st_stock_release), so a
+ * return to stock rebuilds the factory mapping. Exactly that one sector, nothing else above FL_SMP_HI. V-Track
+ * stores nothing there (its storage_hw.c writes FL_DATA only); the windows stay for the update path's tests. */
 #define FL_STOCKTAG_LO  0x000EA000u
 #define FL_STOCKTAG_HI  0x000EB000u
 #define FL_STOCKTAG_OFF 0x000EAFF8u

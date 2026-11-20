@@ -1,45 +1,54 @@
 /* SPDX-License-Identifier: GPL-3.0-only
- * Copyright (C) 2026 Leo Kuroshita (@kurogedelic), Hügelton Instruments */
-/* Persistent storage on the SPI NOR.
- *
- * Every object has an A/B sector pair. A save goes to the copy that is not
- * the current one: erase the sector, program the payload pages (from offset
- * 256), then the 32-byte header at offset 0 LAST. The header is the commit
- * record (magic, seq, length, payload CRC, header CRC); on load the valid
- * copy with the newest seq wins (including wrap), so a write torn at any point leaves the
- * previous copy in charge.
- *
- * Flash access goes through three hooks (also used by the host test):
- *   st_read(off, dst, n)   st_erase(off)   st_prog(off, src, n)
- */
-#define ST_MAGIC 0x554C4546u                   /* "FELU" */
+ * Copyright (C) 2026 Leo Kuroshita (@kurogedelic), Hügelton Instruments
+ * V-Track: Copyright (C) 2026 Manuel Rubin */
+/* Persistent storage on the SPI NOR: V-Track's store, the data family VTRACK, in the store window FL_DATA
+ * (0x9D000..0xBAFFF, fm1_flash_map.h) and nowhere else.
+ *   st_boot()                   once at power-on, before any other st_* call: the owner tag checked (below), the
+ *                               pool scanned. Without it (no flash part answered) the store is empty and refuses
+ *                               every save
+ *   st_save(obj, src, len)      object obj (0 .. ST_OBJECTS - 1) written anew: 0, ST_FULL if the pool has no room
+ *                               for it beside every object's current copy (nothing written), or another negative
+ *                               value if the flash failed (the object's previous copy stays current)
+ *   st_load(obj, dst, max)      the object's current copy into dst: its length, -1 if there is none (or it is
+ *                               longer than max)
+ *   st_size(obj)                its length, -1 if there is none
+ *   st_held(obj)                the sectors its current copy takes; st_used(): every object's; ST_POOL sectors in all
+ *   st_tidy()                   one sector no current copy holds erased ahead of a save, if one needs it: 1 if done
+ *   st_room_erased(len)         1 if len bytes fit into sectors already erased (a save without an erase)
+ *   st_owner_cleared            1 if the boot cleared another firmware's data
+ * The pool: the sectors after the owner tag. An object is stored as a copy of one or more parts, a part a sector:
+ * its 32-byte header (magic, object, part, parts, the copy's sequence number, the part's and the object's length,
+ * the part's CRC, the header's CRC) at offset 0, written LAST, the part's bytes after it. A copy is complete when
+ * every one of its parts is there with valid CRCs; an object's current copy is its complete copy with the highest
+ * sequence number. A save writes a new copy, with a sequence number above every other, into sectors no current copy
+ * holds, so a write torn at any point leaves the previous copy current: nothing is half-written.
+ * The owner tag: the store window is the stock firmware's VM, so after an install it may hold the stock firmware's
+ * or another firmware's data (Felucca's too), which V-Track must never read as its own. The first sector holds the
+ * tag "SMK37DATAVTRACK". Anything else there (another tag, or none): every sector of the window that is not
+ * erased is erased, then the tag written.
+ * Flash access goes through three hooks (storage_hw.c on the device; the host tests bring their own):
+ *   st_read(off, dst, n)   st_erase(off)   st_prog(off, src, n) */
+#if !BOARD_SMK37
+#error "storage.c: the SMK-37 store window"
+#endif
+#define ST_MAGIC 0x4B525456u                   /* "VTRK" */
 #define ST_SECTOR 4096u
-#define ST_PAYLOAD_OFF 256u
-#define ST_PAYLOAD_MAX (ST_SECTOR - ST_PAYLOAD_OFF)
-
-/* flash map (FL_DATA 0x97000..0xDFFFF, FL_GLOB 0xFC000.., FL_AUTO 0xE5000..0xE6FFF, FL_VBANK 0xE7000): settings 0xFC000, projects
- * 0x97000..0x9EFFF, user sample slots 0xA0000..0xDBFFF (eng_sample.c), user preset banks 0xDC000..0xDFFFF (upreset.c),
- * the user presets' FM6 patches (up_fm6.c, since 1.0.3): copy A 0x9F000, copy B 0xFE000; the autosave (project.c,
- * 1.2): A 0xE5000, B 0xE6000, above the OTA staging (0xE0000..0xE4FFF), in the margin the stock firmware's own update
- * stages into (only ever while the stock firmware runs: a later Felucca finds no valid copy and starts as without one).
- * Those two sectors held the FM6 patch bank of 1.0..1.0.2 (OBJ_FM6BANK, retired): both objects use the same pair,
- * told apart by the commit record's type. The bank is only read, once, to move its patches into the user presets
- * (up_fm6.c upf_boot); the first write of the new object goes to the sector that does not hold the bank's newest
- * copy (st_save_to), so a power cut never loses both.
- * The FM6 voice bank (1.4.1, fm6_vbank.c): 0xE7000, the sector above the autosave, with a commit record of the same
- * kind (type OBJ_FM6VB, not an st_load object); a new bank is first staged in the autosave's older copy (fm6_vbank.c). */
-enum { OBJ_SETTINGS, OBJ_PROJECT0, OBJ_UPRESET0 = OBJ_PROJECT0 + 4, OBJ_FM6BANK = OBJ_UPRESET0 + 2, OBJ_UPFM6,
-       OBJ_AUTOSAVE, OBJ_COUNT };
-#define OBJ_FM6VB 32u                          /* the voice bank's commit records (fm6_vbank.c; >= OBJ_COUNT: st_load
-                                                * never takes one, no object here takes its sectors) */
+#define ST_HEAD 32u                            /* the header; the part's bytes after it */
+#define ST_PART (ST_SECTOR - ST_HEAD)          /* a part's bytes, at most */
+#define ST_OWNER_OFF FL_DATA_LO
+#define ST_POOL_LO (FL_DATA_LO + ST_SECTOR)
+#define ST_POOL ((FL_DATA_HI - ST_POOL_LO) / ST_SECTOR)   /* 29 sectors */
+#define ST_OBJECTS 5u                          /* store.c: the four slots, the autosave */
+#define ST_FULL (-2)
+_Static_assert(FL_WIN_SAFE(FL_DATA_LO, FL_DATA_HI) && ST_POOL == 29u, "the store window: the tag and the pool");
 
 typedef struct {
     uint32_t magic;
-    uint16_t type, slot;
-    uint32_t seq, len, crc, rsv[2];
+    uint8_t obj, part, parts, rsv;
+    uint32_t seq, len, total, crc, rsv2;
     uint32_t hcrc;
 } st_hdr_t;
-_Static_assert(sizeof(st_hdr_t) == 32u, "storage commit record layout");
+_Static_assert(sizeof(st_hdr_t) == ST_HEAD, "storage header layout");
 
 static int st_read(uint32_t off, void *dst, uint32_t n);
 static int st_erase(uint32_t off);
@@ -61,224 +70,247 @@ static uint32_t st_crc32_add(uint32_t c, const void *p, uint32_t n)   /* zlib CR
 }
 static uint32_t st_crc32(const void *p, uint32_t n) { return ~st_crc32_add(0xFFFFFFFFu, p, n); }
 
-#if BOARD_SMK37
-/* SMK-37 Pro: every object in FL_DATA 0x9D000..0xBAFFF (the stock VM),
- * A/B neighbours: projects 0x9D000..0xA4FFF, user preset banks 0xA5000..0xA8FFF, autosave 0xA9000 /
- * 0xAA000, the user presets' FM6 patches (OBJ_UPFM6, the pair of the retired OBJ_FM6BANK) 0xAB000 / 0xAC000,
- * settings 0xAD000 / 0xAE000; the store owner tag 0xAF000 (st_owner_check), the FM6 voice bank 0xB0000
- * (fm6_vbank.c FVB_HOME); 0xB1000..0xBAFFF spare. Never near BTIF / USRTRIM (0xC0000..0xC1FFF) or key_mac
- * (0xFF000). */
-#define ST_SMK_BASE 0x9D000u
-#define ST_SMK_PAIRS 9u
-#define ST_SMK_SECTORS (2u * ST_SMK_PAIRS)
-#define ST_SMK_VBANK 0xB0000u                  /* the FM6 voice bank (fm6_vbank.c), one sector */
-_Static_assert(OBJ_COUNT == 10u && OBJ_UPFM6 == OBJ_FM6BANK + 1u, "SMK store: a new object needs a place");
-_Static_assert(ST_SMK_BASE + ST_SMK_SECTORS * ST_SECTOR == 0xAF000u, "SMK store: the objects end at the owner tag");
-_Static_assert(ST_SMK_VBANK >= 0xAF000u + ST_SECTOR && ST_SMK_VBANK + ST_SECTOR <= 0xBB000u, "SMK store: past FL_DATA");
-static uint32_t st_sector(uint32_t obj, uint32_t copy)  /* flash offset of copy A (0) / B (1) */
-{
-    static const uint8_t ORDER[OBJ_COUNT] = {
-        [OBJ_PROJECT0] = 0, [OBJ_PROJECT0 + 1] = 1, [OBJ_PROJECT0 + 2] = 2, [OBJ_PROJECT0 + 3] = 3,
-        [OBJ_UPRESET0] = 4, [OBJ_UPRESET0 + 1] = 5, [OBJ_AUTOSAVE] = 6, [OBJ_FM6BANK] = 7, [OBJ_UPFM6] = 7,
-        [OBJ_SETTINGS] = 8};
-    return ST_SMK_BASE + (ORDER[obj % OBJ_COUNT] * 2u + (copy & 1u)) * ST_SECTOR;
-}
+static struct {                                /* what each pool sector holds, from the scan */
+    st_hdr_t h;
+    uint8_t valid;                             /* a part: header and bytes intact */
+    uint8_t erased;                            /* all 0xFF: written without an erase */
+} st_sec[ST_POOL];
+static uint32_t st_cur[ST_OBJECTS];            /* each object's current copy (its sequence number), 0: none */
+static uint32_t st_seq;                        /* the highest sequence number in the pool */
+static uint8_t st_owner_cleared;
+static uint8_t st_ok;                          /* st_boot ran: the store may be written */
+static uint8_t st_page[256] __attribute__((aligned(4)));   /* the driver wants RAM sources (main loop only) */
 
-/* The owner of the store. The store area is the stock firmware's VM, so after an install it may hold the stock
- * firmware's (or any other firmware's) data, which Felucca must never parse as its own. The sector after the objects
- * (0xAF000) holds the tag "SMK37DATAFELUCCA". Tagged: load as ever. Anything else (another tag, or none): clear the
- * objects (0x9D000..0xAEFFF) and the FM6 voice bank (0xB0000), then write the tag. FELUCCA_DATA_UNTAGGED_OK 1 would
- * keep a store with an erased tag (0: the SMK build never wrote untagged data). User samples (FL_SMP) validate
- * themselves. Calibration, BT pairing and key_mac are outside FL_DATA: never touched. Called first in persist_boot
- * (project.c), before any store read. */
-#ifndef FELUCCA_DATA_UNTAGGED_OK
-#define FELUCCA_DATA_UNTAGGED_OK 0
-#endif
-#define ST_OWNER_OFF 0xAF000u
-_Static_assert(ST_OWNER_OFF == ST_SMK_BASE + ST_SMK_SECTORS * ST_SECTOR && ST_OWNER_OFF != ST_SMK_VBANK,
-               "SMK store owner: the sector after the objects");
-/* The stock firmware's mapping in USRFLASH (global settings at 0xC2000, magic A3 3A; 8 presets from 0xC3000 every
- * 0x5000, 0x29E3 bytes each, the rest erased; the end marker "usrdata\0" at 0xEAFF8, FL_STOCKTAG): the stock firmware
- * trusts the area while the marker is there and never rebuilds it, so after a return to stock the user samples
- * would be its key, knob and fader mapping (every key one note). So: an intact stock mapping is kept (it reads as
- * empty slots), and the marker is released (its sector erased: the stock firmware rebuilds its factory mapping at
- * its next start) before the first erase in USRFLASH (storage_hw.c st_erase, editor.c) and at boot when it stands
- * over anything else (st_owner_check: ours, an older build's, another firmware's). */
-static int st_stock_tagged(void)
+static uint32_t st_off(uint32_t s) { return ST_POOL_LO + s * ST_SECTOR; }
+
+static int st_is_erased(uint32_t off, uint32_t n)   /* [off, off + n) all 0xFF */
 {
-    static const uint8_t TAG[8] = {'u', 's', 'r', 'd', 'a', 't', 'a', 0};
-    uint8_t t[8];
-    uint32_t i;
-    if (st_read(FL_STOCKTAG_OFF, t, 8))
-        return 0;
-    for (i = 0; i < 8u; i++)
-        if (t[i] != TAG[i])
+    uint32_t k, i;
+    for (; n; off += k, n -= k) {
+        k = n > sizeof st_page ? sizeof st_page : n;
+        if (st_read(off, st_page, k))
             return 0;
+        for (i = 0; i < k; i++)
+            if (st_page[i] != 0xFFu)
+                return 0;
+    }
     return 1;
 }
-static int st_stock_intact(void)                /* the marker over the stock layout */
+
+static int st_part_ok(uint32_t s, const st_hdr_t *h)   /* the part's bytes match its CRC */
 {
-    uint8_t b[8];
-    uint32_t n, k, i, ff;
-    if (!st_stock_tagged() || st_read(FL_SMP_LO, b, 2) || b[0] != 0xA3u || b[1] != 0x3Au)
-        return 0;
-    for (n = 0; n < 8u; n++)                    /* each preset: its head written, its last two sectors erased */
-        for (k = 0; k < 3u; k++) {
-            if (st_read(FL_SMP_LO + 0x1000u + n * 0x5000u + (k ? 0x2000u + k * 0x1000u : 0u), b, 8))
-                return 0;
-            for (ff = 1, i = 0; i < 8u; i++)
-                ff &= b[i] == 0xFFu;
-            if (ff != (k != 0u))
-                return 0;
-        }
-    return 1;
+    uint32_t c = 0xFFFFFFFFu, k, off = st_off(s) + ST_HEAD, n = h->len;
+    for (; n; off += k, n -= k) {
+        k = n > sizeof st_page ? sizeof st_page : n;
+        if (st_read(off, st_page, k))
+            return 0;
+        c = st_crc32_add(c, st_page, k);
+    }
+    return ~c == h->crc;
 }
-static void st_stock_release(void)              /* erase the marker's sector, once: later calls find no marker */
+
+static void st_scan_sector(uint32_t s)
 {
-    if (st_stock_tagged())
-        st_erase(FL_STOCKTAG_LO);
-}
-static inline int st_in_usrflash(uint32_t off) { return off >= FL_SMP_LO && off < FL_SMP_HI; }
-static uint8_t st_owner_cleared;                /* (the UI may say so) */
-static void st_owner_check(void)
-{
-    static const char FAM[] = "FELUCCA";            /* the tag: "SMK37DATA" + this, zero-padded to 16 B */
-    uint8_t tag[16], want[16];
-    uint32_t i, erased = 1, ours = 1, s;
-    for (i = 0; i < 16u; i++)
-        want[i] = i < 9u ? (uint8_t)"SMK37DATA"[i] : i - 9u < sizeof FAM - 1u ? (uint8_t)FAM[i - 9u] : 0u;
-    if (!st_stock_intact())
-        st_stock_release();                     /* the marker over anything but the stock mapping: let it rebuild */
-    if (st_read(ST_OWNER_OFF, tag, 16))
+    st_hdr_t *h = &st_sec[s].h;
+    st_sec[s].valid = st_sec[s].erased = 0;
+    if (st_read(st_off(s), h, sizeof *h))
         return;
-    for (i = 0; i < 16u; i++) {
-        erased &= tag[i] == 0xFFu;
-        ours &= tag[i] == want[i];
-    }
-    if (ours)
-        return;
-    if (!erased || !FELUCCA_DATA_UNTAGGED_OK) {     /* not ours (or untagged data): clear it */
-        for (s = 0; s < ST_SMK_SECTORS; s++)
-            st_erase(ST_SMK_BASE + s * ST_SECTOR);
-        st_erase(ST_SMK_VBANK);
-        st_owner_cleared = 1;
-    }
-    st_erase(ST_OWNER_OFF);
-    st_prog(ST_OWNER_OFF, want, 16);
-}
-#else
-static void st_owner_check(void) {}
-static uint32_t st_sector(uint32_t obj, uint32_t copy)  /* flash offset of copy A (0) / B (1) */
-{
-    if (obj == OBJ_SETTINGS)
-        return 0xFC000u + copy * ST_SECTOR;
-    if (obj == OBJ_FM6BANK || obj == OBJ_UPFM6)          /* (the same pair: see the flash map) */
-        return copy ? 0xFE000u : 0x9F000u;
-    if (obj == OBJ_AUTOSAVE)
-        return 0xE5000u + copy * ST_SECTOR;
-    if (obj >= OBJ_UPRESET0)
-        return 0xDC000u + (obj - OBJ_UPRESET0) * 2u * ST_SECTOR + copy * ST_SECTOR;
-    return 0x97000u + (obj - OBJ_PROJECT0) * 2u * ST_SECTOR + copy * ST_SECTOR;
-}
-#endif
-
-static uint8_t st_buf[ST_PAYLOAD_MAX] __attribute__((aligned(4), section(".pool")));   /* (main loop only) */
-
-static int st_head(uint32_t obj, uint32_t copy, st_hdr_t *h)   /* commit record valid: 0 */
-{
-    if (obj >= OBJ_COUNT || copy > 1u)
-        return -1;
-    if (st_read(st_sector(obj, copy), h, sizeof *h))
-        return -1;
-    if (h->magic != ST_MAGIC || h->type != obj || h->slot != copy || h->len > ST_PAYLOAD_MAX ||
-        h->hcrc != st_crc32(h, sizeof *h - 4u))
-        return -1;
-    return 0;
+    if (h->magic == ST_MAGIC && h->hcrc == st_crc32(h, sizeof *h - 4u) && h->obj < ST_OBJECTS &&
+        h->part < h->parts && h->len <= ST_PART && h->total <= (uint32_t)h->parts * ST_PART && st_part_ok(s, h))
+        st_sec[s].valid = 1;
+    else
+        st_sec[s].erased = (uint8_t)st_is_erased(st_off(s), ST_SECTOR);
 }
 
-static int st_body(uint32_t obj, uint32_t copy, const st_hdr_t *h)   /* payload -> st_buf, CRC ok: 0 */
+static int st_part_at(uint32_t obj, uint32_t seq, uint32_t part)   /* the sector of the copy's part, -1: none */
 {
-    if (st_read(st_sector(obj, copy) + ST_PAYLOAD_OFF, st_buf, h->len) || st_crc32(st_buf, h->len) != h->crc)
-        return -1;
-    return 0;
-}
-
-/* the current copy: the newest valid sequence (A on a tie), -1 when
- * neither is valid. Headers first, so only the winner's payload is read (it
- * is left in st_buf); *h gets its header. */
-static int st_current(uint32_t obj, st_hdr_t *h)
-{
-    st_hdr_t a, b;
-    int va = st_head(obj, 0, &a) == 0, vb = st_head(obj, 1, &b) == 0;
-    if (vb && (!va || (b.seq != a.seq && b.seq - a.seq < 0x80000000u))) {
-        if (st_body(obj, 1, &b) == 0) {
-            *h = b;
-            return 1;
-        }
-        vb = 0;
-    }
-    if (va && st_body(obj, 0, &a) == 0) {
-        *h = a;
-        return 0;
-    }
-    if (vb && st_body(obj, 1, &b) == 0) {
-        *h = b;
-        return 1;
-    }
+    uint32_t s;
+    for (s = 0; s < ST_POOL; s++)
+        if (st_sec[s].valid && st_sec[s].h.obj == obj && st_sec[s].h.seq == seq && st_sec[s].h.part == part)
+            return (int)s;
     return -1;
 }
 
-/* load the whole object into dst; returns its length, or -1 if it does not fit */
-static int st_load(uint32_t obj, void *dst, uint32_t max)
+static int st_complete(uint32_t obj, uint32_t seq, uint32_t parts, uint32_t total)
 {
-    uint32_t i;
-    st_hdr_t h;
-    if (obj >= OBJ_COUNT || st_current(obj, &h) < 0 || h.len > max)
-        return -1;
-    for (i = 0; i < h.len; i++)
-        ((uint8_t *)dst)[i] = st_buf[i];
-    return (int)h.len;
+    uint32_t p, sum = 0;
+    for (p = 0; p < parts; p++) {
+        int s = st_part_at(obj, seq, p);
+        if (s < 0 || st_sec[s].h.parts != parts || st_sec[s].h.total != total)
+            return 0;
+        sum += st_sec[s].h.len;
+    }
+    return sum == total;
 }
 
-/* save into copy `to` (0 A, 1 B; -1: the one that is not the current copy, as st_save) */
-static int st_save_to(uint32_t obj, const void *src, uint32_t len, int to)
+static void st_current(void)                   /* each object's current copy, from st_sec */
 {
-    uint32_t seq, base, off;
-    int cur, rc;
-    st_hdr_t h;
-    if (obj >= OBJ_COUNT || len > ST_PAYLOAD_MAX || to > 1)
+    uint32_t s, o;
+    st_seq = 0;
+    for (o = 0; o < ST_OBJECTS; o++)
+        st_cur[o] = 0;
+    for (s = 0; s < ST_POOL; s++) {
+        const st_hdr_t *h = &st_sec[s].h;
+        if (!st_sec[s].valid)
+            continue;
+        if (h->seq > st_seq)
+            st_seq = h->seq;
+        if (h->seq > st_cur[h->obj] && st_complete(h->obj, h->seq, h->parts, h->total))
+            st_cur[h->obj] = h->seq;
+    }
+}
+
+static int st_holds(uint32_t s)                /* sector s is part of an object's current copy */
+{
+    return st_sec[s].valid && st_cur[st_sec[s].h.obj] == st_sec[s].h.seq;
+}
+
+static void st_owner_check(void)
+{
+    static const char TAG[16] = "SMK37DATAVTRACK";
+    uint8_t tag[16];
+    uint32_t off;
+    if (st_read(ST_OWNER_OFF, tag, sizeof tag) == 0 && !memcmp(tag, TAG, sizeof tag))
+        return;
+    for (off = FL_DATA_LO; off < FL_DATA_HI; off += ST_SECTOR)
+        if (!st_is_erased(off, ST_SECTOR)) {
+            st_erase(off);
+            st_owner_cleared = off != ST_OWNER_OFF || st_owner_cleared;
+        }
+    memcpy(st_page, TAG, sizeof TAG);
+    st_prog(ST_OWNER_OFF, st_page, sizeof TAG);
+}
+
+static void st_boot(void)
+{
+    uint32_t s;
+    st_owner_cleared = 0;
+    st_owner_check();
+    for (s = 0; s < ST_POOL; s++)
+        st_scan_sector(s);
+    st_current();
+    st_ok = 1;
+}
+
+static uint32_t st_parts(uint32_t len) { return len ? (len + ST_PART - 1u) / ST_PART : 1u; }
+
+static int st_size(uint32_t obj)
+{
+    int s;
+    if (obj >= ST_OBJECTS || !st_cur[obj] || (s = st_part_at(obj, st_cur[obj], 0)) < 0)
         return -1;
-    cur = st_current(obj, &h);
-    seq = cur < 0 ? 0u : h.seq;
-    if (to < 0)
-        to = cur == 0 ? 1 : 0;                        /* write the other copy */
-    base = st_sector(obj, (uint32_t)to);
-    for (off = 0; off < len; off++)
-        st_buf[off] = ((const uint8_t *)src)[off];    /* the driver wants RAM sources */
-    if ((rc = st_erase(base)) != 0)
-        return rc;
-    for (off = 0; off < len; off += 256u) {
-        uint32_t n = len - off > 256u ? 256u : len - off;
-        if ((rc = st_prog(base + ST_PAYLOAD_OFF + off, st_buf + off, n)) != 0)
-            return rc;
+    return (int)st_sec[s].h.total;
+}
+
+static uint32_t st_held(uint32_t obj)
+{
+    uint32_t s, n = 0;
+    for (s = 0; s < ST_POOL; s++)
+        n += st_holds(s) && st_sec[s].h.obj == obj;
+    return n;
+}
+
+static uint32_t st_used(void)
+{
+    uint32_t s, n = 0;
+    for (s = 0; s < ST_POOL; s++)
+        n += (uint32_t)st_holds(s);
+    return n;
+}
+
+static int st_load(uint32_t obj, void *dst, uint32_t max)
+{
+    uint32_t p, at = 0;
+    int len = st_size(obj);
+    if (len < 0 || (uint32_t)len > max)
+        return -1;
+    for (p = 0; p < st_parts((uint32_t)len); p++) {
+        int s = st_part_at(obj, st_cur[obj], p);
+        st_hdr_t h;
+        if (s < 0 || st_read(st_off((uint32_t)s), &h, sizeof h) || memcmp(&h, &st_sec[s].h, sizeof h) ||
+            st_read(st_off((uint32_t)s) + ST_HEAD, (uint8_t *)dst + at, h.len) ||
+            st_crc32((uint8_t *)dst + at, h.len) != h.crc)
+            return -1;
+        at += h.len;
     }
-    h.magic = ST_MAGIC;
-    h.type = (uint16_t)obj;
-    h.slot = (uint16_t)to;
-    h.seq = seq + 1u;
-    h.len = len;
-    h.crc = st_crc32(st_buf, len);
-    h.rsv[0] = h.rsv[1] = 0xFFFFFFFFu;
-    h.hcrc = st_crc32(&h, sizeof h - 4u);
-    if ((rc = st_prog(base, &h, sizeof h)) != 0)       /* the commit record, last */
-        return rc;
-    {   /* read back: a write-protected or failing part must not report SAVED */
-        st_hdr_t chk;
-        uint32_t c = (uint32_t)to;
-        if (st_head(obj, c, &chk) || memcmp(&chk, &h, sizeof h) || st_body(obj, c, &chk))
-            return -7;
-    }
+    return len;
+}
+
+static int st_room_erased(uint32_t len)
+{
+    uint32_t s, n = 0;
+    for (s = 0; s < ST_POOL; s++)
+        n += !st_holds(s) && st_sec[s].erased;
+    return n >= st_parts(len);
+}
+
+static int st_tidy(void)
+{
+    uint32_t s;
+    for (s = 0; s < ST_POOL && st_ok; s++)
+        if (!st_holds(s) && !st_sec[s].erased) {
+            st_sec[s].valid = 0;
+            st_sec[s].erased = st_erase(st_off(s)) == 0 && st_is_erased(st_off(s), ST_SECTOR);
+            return 1;
+        }
     return 0;
 }
 
-static int st_save(uint32_t obj, const void *src, uint32_t len) { return st_save_to(obj, src, len, -1); }
+static int st_write_part(uint32_t s, st_hdr_t *h, const uint8_t *src)   /* erase if needed, bytes, header last */
+{
+    uint32_t off = st_off(s), at, k;
+    int rc;
+    st_sec[s].valid = 0;
+    if (!st_sec[s].erased && (rc = st_erase(off)) != 0)
+        return rc;
+    st_sec[s].erased = 0;
+    for (at = 0; at < h->len; at += k) {       /* pages: the first one after the header */
+        k = 256u - ((ST_HEAD + at) & 255u);
+        k = k > h->len - at ? h->len - at : k;
+        memcpy(st_page, src + at, k);
+        if ((rc = st_prog(off + ST_HEAD + at, st_page, k)) != 0)
+            return rc;
+    }
+    h->hcrc = st_crc32(h, sizeof *h - 4u);
+    memcpy(st_page, h, sizeof *h);
+    if ((rc = st_prog(off, st_page, sizeof *h)) != 0)   /* the header, last */
+        return rc;
+    st_scan_sector(s);                         /* read back: a failing part must not count as saved */
+    return st_sec[s].valid && !memcmp(&st_sec[s].h, h, sizeof *h) ? 0 : -7;
+}
+
+static int st_save(uint32_t obj, const void *src, uint32_t len)
+{
+    uint32_t parts = st_parts(len), free = 0, s, p, at = 0;
+    int rc = 0;
+    if (obj >= ST_OBJECTS || !st_ok)
+        return -1;
+    for (s = 0; s < ST_POOL; s++)
+        free += !st_holds(s);
+    if (parts > free || len > parts * ST_PART)
+        return ST_FULL;
+    st_seq++;
+    for (p = 0; p < parts && !rc; p++) {
+        st_hdr_t h;
+        uint32_t best = ST_POOL;
+        for (s = 0; s < ST_POOL; s++)          /* a free sector, erased ones first */
+            if (!st_holds(s) && !(st_sec[s].valid && st_sec[s].h.obj == obj && st_sec[s].h.seq == st_seq) &&
+                (best == ST_POOL || (st_sec[s].erased && !st_sec[best].erased)))
+                best = s;
+        memset(&h, 0, sizeof h);
+        h.magic = ST_MAGIC;
+        h.obj = (uint8_t)obj;
+        h.part = (uint8_t)p;
+        h.parts = (uint8_t)parts;
+        h.rsv = 0xFFu;
+        h.rsv2 = 0xFFFFFFFFu;
+        h.seq = st_seq;
+        h.len = len - at > ST_PART ? ST_PART : len - at;
+        h.total = len;
+        h.crc = st_crc32((const uint8_t *)src + at, h.len);
+        rc = best == ST_POOL ? -1 : st_write_part(best, &h, (const uint8_t *)src + at);
+        at += h.len;
+    }
+    st_current();
+    return rc ? rc : st_cur[obj] == st_seq ? 0 : -7;
+}
