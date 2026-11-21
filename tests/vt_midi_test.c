@@ -5,7 +5,8 @@
  * (a new note, a cut, a release, stop); a live note goes out on its track's channel too. Playing sends MIDI start, a
  * clock of 24 pulses a quarter (6 a row, the first with row 0) and stop. Incoming MIDI clock drives the rows instead
  * of the tempo (the first pulse after a start is row 0's, every 6th the next row's); MIDI start and stop start and
- * stop playing; V-Track sends no clock of its own meanwhile. Half a second without a pulse, the tempo drives again.
+ * stop playing; V-Track sends no clock of its own meanwhile. Half a second without a pulse, the tempo drives again,
+ * the row's pulses counted (no clock sent for a MIDI start's playing). SEQ PLAY always sends start, its stop stop.
  *   tests/vt_midi_test */
 #include <math.h>
 #include "vt_sim.h"
@@ -330,6 +331,16 @@ int main(void)
         got = midi_out();
         snprintf(what, sizeof what, "pulses while stopped: nothing plays (%s)", got);
         check(!strcmp(got, ""), what);
+        button(SMK_BTN_SEQ_PLAY);        /* SEQ PLAY 20 ms after the last pulse: V-Track's own playing, sent */
+        got = midi_out();
+        snprintf(what, sizeof what, "SEQ PLAY just after pulses while stopped: start and a pulse sent (%.40s)", got);
+        check(!strncmp(got, "start . 1+60/127", 16), what);
+        sim_midi_in(0xF8, 0, 0);         /* a pulse in meanwhile: it drives the rows, ... */
+        sim_run_ms(20);
+        button(SMK_BTN_SEQ_PLAY);
+        got = midi_out();
+        snprintf(what, sizeof what, "SEQ PLAY again, a pulse in before: stop sent (%.40s)", got);
+        check(count(got, "stop") == 1u, what);
 
         sim_midi_in(0xFA, 0, 0);         /* started again, then the clock stops: the tempo drives after 500 ms */
         sim_run_ms(3);
@@ -337,15 +348,15 @@ int main(void)
             sim_midi_in(0xF8, 0, 0);
             sim_run_ms(i % 3u == 2u ? 20 : 21);
         }
-        midi_out();
-        sim_run_ms(450);
+        midi_out();                      /* (the last pulse 20 ms ago, row 0's third: 4 pulses of the row to come) */
+        sim_run_ms(540);
         got = midi_out();
-        snprintf(what, sizeof what, "no pulse for 450 ms: still row 0 (%s)", got);
+        snprintf(what, sizeof what, "no pulse for 560 ms: still row 0 (%s)", got);
         check(!strcmp(got, ""), what);
-        sim_run_ms(250);
+        sim_run_ms(80);                  /* 500 ms, then the row's 4 pulses left at 90 BPM: 111 ms */
         got = midi_out();
-        snprintf(what, sizeof what, "half a second without a pulse: the tempo plays row 1, clock sent (%.40s)", got);
-        check(strstr(got, "1-60 1+64/127 3-60") && strchr(got, '.'), what);
+        snprintf(what, sizeof what, "the tempo plays the rest of the row: row 1 by 640 ms, no clock (%.40s)", got);
+        check(!strcmp(got, "1-60 1+64/127 3-60"), what);
         button(SMK_BTN_SEQ_PLAY);
     }
 
