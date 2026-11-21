@@ -12,8 +12,9 @@ Commit 1988bb9.
 - **Autosave while the sequencer plays.** The ticket says that the current project is autosaved. An erase silences
   the audio for some 40 ms, so while the sequencer plays (or a key is held) the autosave only writes into sectors
   that were erased in advance, during stop. In a very long playing or live-recording session these can run out; the
-  autosave then waits until stop, and a power cut in that time loses more than the last few seconds. **Open
-  decision:** keep this, or autosave anyway after some time (for example 20 s) and accept a short dropout.
+  autosave then waits until stop, and a power cut in that time loses more than the last few seconds. **Decided
+  (2026-11-21): kept for now.** The alternative, autosaving anyway after some time (for example 20 s) and accepting
+  a short dropout, can be revisited later.
 - **Audio hash in the save/load test.** The criterion asks that the reloaded project plays identically (audio hash).
   The chip keeps state from whatever played before, and playback starts at a different point within the audio block.
   So the test builds its project with silent edits and hashes a fixed length from the first non-zero sample. The
