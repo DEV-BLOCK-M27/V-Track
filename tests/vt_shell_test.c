@@ -3,7 +3,8 @@
 /* The V-Track app shell on the simulated SMK-37 (seam A, tests/vt_sim.h): it boots through a screen showing the
  * name into the pattern view (track 1's rows, tests/vt_pattern_test.c), silent, the button LEDs dark, the pads
  * showing the rows; a key played (it sounds: tests/vt_note_test.c) leaves the screen and the LEDs as they are; the
- * controls V-Track does not use yet and USB MIDI in change nothing (MIDI in is taken, never refused); the flash
+ * controls V-Track does not use yet and USB MIDI messages it does not use (control changes) change nothing (MIDI
+ * in is taken, never refused; notes and clock: tests/vt_midi_test.c); the flash
  * gets the store's owner tag (the first boot) and nothing else: an unchanged project is not autosaved.
  *   tests/vt_shell_test [OUT_DIR]   (OUT_DIR: the screen as shell.ppm) */
 #include "vt_sim.h"
@@ -84,9 +85,11 @@ int main(int argc, char **argv)
     sim_audio(&frames);                  /* (what it played: tests/vt_note_test.c) */
     check(sim_screen_text("NES \xB7 PULSE 1") && sim_screen_text("00"), "a key played: the screen as it was");
     check(buttons_dark() && pads_kept(), "a key played: the LEDs as they were");
-    check(sim_midi_out(pkts, 16) == 0, "a key played: no MIDI out");
+    check(sim_midi_out(pkts, 16) == 2u && (pkts[0] & 0xFFFFu) == 0x9009u && (pkts[1] & 0xFFFFu) == 0x8008u,
+          "a key played: its note on and off on MIDI channel 1, nothing else");
 
-    {   /* inputs not used yet: buttons, encoders, faders, wheels; USB MIDI notes, more than the device's ring holds */
+    {   /* inputs not used yet: buttons, encoders, faders, wheels; USB MIDI control changes, more than the device's
+         * ring holds */
         uint32_t i, refused = 0;
         sim_button(SMK_BTN_SEQ, 1);
         sim_encoder(0, 3);
@@ -97,8 +100,8 @@ int main(int argc, char **argv)
         sim_button(SMK_BTN_SEQ, 0);
         sim_encoder(0, -3);
         for (i = 0; i < 1000u; i++) {
-            refused += !sim_midi_in(0x90, (uint8_t)(48u + i % 24u), 100);
-            refused += !sim_midi_in(0x80, (uint8_t)(48u + i % 24u), 0);
+            refused += !sim_midi_in(0xB0, (uint8_t)(1u + i % 24u), 100);
+            refused += !sim_midi_in(0xB0, (uint8_t)(1u + i % 24u), 0);
             sim_run_ms(2);
         }
         sim_run_ms(100);

@@ -36,6 +36,9 @@
 #                   memory's fullness; save, power cycle, load plays and shows the same; the autosave after a power
 #                   cut; another firmware's store cleared on first boot; a project too big refused, the slot kept;
 #                   the stored format's version, chip and channel per track); the screen in build/host/project.ppm.
+#                   tests/vt_midi_test.c: USB MIDI (notes in play the selected track; the tracks' notes, pattern and
+#                   live, out on channels 1 to 4; V-Track's clock, start and stop out; clock in drives the rows,
+#                   start and stop in play and stop, the tempo back half a second after the last pulse).
 # NES chip core (seam B, tests/nes_test.c): register states in, samples out: duty waveforms, period -> frequency,
 #                   the triangle's staircase, the noise's periods and LFSR modes, the 2A03 mixer, no aliasing on
 #                   high notes.
@@ -160,6 +163,9 @@ run "DEVICE: editing (clear, insert, delete, copy, paste, undo) and recording (v
 $CC $VT -o "$OUT/vt_project_test" tests/vt_project_test.c
 run "DEVICE: projects (GLOBE): four slots, save, load, new, autosave, another family cleared, too big refused" \
     "$OUT/vt_project_test" "$OUT"
+$CC $VT -o "$OUT/vt_midi_test" tests/vt_midi_test.c -lm
+run "DEVICE: USB MIDI: notes in play the selected track, notes out on channels 1 to 4, clock out, clock in followed" \
+    "$OUT/vt_midi_test"
 
 # seam B: the NES chip core alone
 $CC -o "$OUT/nes_test" tests/nes_test.c -lm
@@ -224,6 +230,8 @@ else
     run "ASan/UBSan: DEVICE, editing and recording" "$A/vt_record_test"
     $SCC $VT -o "$A/vt_project_test" tests/vt_project_test.c
     run "ASan/UBSan: DEVICE, saving projects" "$A/vt_project_test"
+    $SCC $VT -o "$A/vt_midi_test" tests/vt_midi_test.c -lm
+    run "ASan/UBSan: DEVICE, USB MIDI notes and clock" "$A/vt_midi_test"
     $SCC -o "$A/nes_test" tests/nes_test.c -lm
     run "ASan/UBSan: NES chip core" "$A/nes_test"
 fi

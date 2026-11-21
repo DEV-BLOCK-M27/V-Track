@@ -74,7 +74,11 @@
  * project the memory has no room for is refused with NOT SAVED: MEMORY FULL (the slot keeps what it held); an
  * autosave the memory has no room for shows AUTOSAVE: MEMORY FULL. Any other button or encoder takes the question
  * back. K3 selects the track, the keys play it (step entry is off).
- * Every other input (USB MIDI in too) is taken and dropped. */
+ * USB MIDI in (usb.c's ring) is taken by the audio ISR a block at a time: clock, start (continue too) and stop go to
+ * the player at once (player.c: the clock drives the rows); notes on and off, of any channel, play the selected
+ * track as the keys do (one note at a time a track, the last one taking the channel; a note off silences the track
+ * it started on), but write nothing into the rows. The player sends the tracks' notes, MIDI clock, start and stop.
+ * Every other input (other MIDI messages too) is taken and dropped. */
 #define VT_NAME "V-Track"
 #define VT_KEY_NOTE0 48u         /* keybed key 0 = C3 (MIDI 48) */
 #define VT_ENC_TRACK 2u          /* K3: track select */
@@ -184,6 +188,8 @@ static struct {
                                        * field takes it first) */
     uint64_t keys;               /* the keybed keys held at the last frame */
     uint8_t key_track[FM1_NKEY]; /* the track each held key plays on */
+    uint8_t midi_track[128];     /* the track each USB MIDI note held plays on, */
+    uint32_t midi_held[4];       /* .. and which are held, a bit each */
     uint16_t pads_held;          /* the pads held at the last frame, a bit each */
     vt_line_t shown[VT_SHOWN];   /* what each screen line shows */
     uint8_t view;                /* VT_VIEW_* */
@@ -704,14 +710,76 @@ static void app_track(int32_t steps)  /* K3 turned: the next track up or down, s
     }
 }
 
+/* USB MIDI in (usb.c's ring; the TIMER5 ISR fills it): the audio ISR takes it, a block at a time (app_midi_in);
+ * its notes on and off go on to the main loop (app_midi_notes) through this ring */
+#define VT_MQ 32u
+static uint32_t app_mq[VT_MQ];
+static volatile uint32_t app_mq_w, app_mq_r;
+static volatile uint8_t app_midi_lost;   /* notes dropped (a ring full): the main loop releases every MIDI note */
+
+static __attribute__((noinline)) void app_midi_in(void)   /* the audio ISR, once a block */
+{
+    if (midi_in_overflow) {              /* a broken stream: dropped, its notes released */
+        mi_r = mi_w;
+        midi_in_overflow = 0;
+        app_midi_lost = 1;
+    }
+    while (mi_r != mi_w) {
+        uint32_t pkt = midi_in_q[mi_r % MQ], st = pkt >> 8 & 0xF0u;
+        RING_PUBLISH();
+        mi_r++;
+        if ((pkt & 15u) == 0xFu) {           /* real time: at once, to the block */
+            st = pkt >> 8 & 0xFFu;
+            if (st == 0xF8u)
+                player_midi_clock();
+            else if (st == 0xFAu || st == 0xFBu)
+                player_midi_start();
+            else if (st == 0xFCu)
+                player_midi_stop();
+        } else if (st == 0x80u || st == 0x90u) {
+            if (app_mq_w - app_mq_r < VT_MQ) {
+                app_mq[app_mq_w % VT_MQ] = pkt;
+                RING_PUBLISH();
+                app_mq_w++;
+            } else {
+                app_midi_lost = 1;
+            }
+        }
+    }
+}
+
+static void app_midi_notes(void)     /* the main loop: USB MIDI notes play the selected track, as the keys do */
+{
+    uint32_t n;
+    if (app_midi_lost) {
+        app_midi_lost = 0;
+        for (n = 0; n < 128u; n++)
+            if (app.midi_held[n >> 5] >> (n & 31u) & 1u)
+                player_note_off(app.midi_track[n], n);
+        memset(app.midi_held, 0, sizeof app.midi_held);
+    }
+    while (app_mq_r != app_mq_w) {
+        uint32_t pkt = app_mq[app_mq_r % VT_MQ], vel = pkt >> 24 & 127u, bit = 1u << ((pkt >> 16) & 31u);
+        uint32_t *held = &app.midi_held[pkt >> 21 & 3u];
+        n = pkt >> 16 & 127u;
+        RING_PUBLISH();
+        app_mq_r++;
+        if (*held & bit) {               /* a note off (a note on again too: off first) */
+            *held &= ~bit;
+            player_note_off(app.midi_track[n], n);
+        }
+        if ((pkt >> 8 & 0xF0u) == 0x90u && vel) {
+            *held |= bit;
+            app.midi_track[n] = app.track;
+            player_note_on(app.track, n, app.ins);
+        }
+    }
+}
+
 static void app_input(void)          /* take every input event */
 {
     uint32_t e, pressed, shift = fm1_in.buttons >> SMK_BTN_KNOB_BANK & 1u;
-    while (mi_r != mi_w) {               /* USB MIDI in (usb.c's ring; the TIMER5 ISR fills it) */
-        RING_PUBLISH();
-        mi_r++;
-    }
-    midi_in_overflow = 0;
+    app_midi_notes();
     pressed = fm1_input_edges(0);
     if (pressed >> SMK_BTN_SEQ_PLAY & 1u && shift) {   /* shift + SEQ PLAY: the pattern-loop mode */
         player_set_loop(!player_loop());
@@ -1266,5 +1334,6 @@ static void app_idle(void) {}
 
 static void app_audio(int32_t *out, uint32_t n)
 {
+    app_midi_in();
     player_audio(out, n);
 }

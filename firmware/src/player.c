@@ -13,6 +13,8 @@
  *                                    the order list's cursor) again, so it loops, and a new cursor takes over at
  *                                    the entry's end
  *   player_playing(), player_entry(), player_row()   whether it plays, the entry and the row playing
+ *   player_midi_clock(), player_midi_start(), player_midi_stop()   in the audio ISR, before player_audio: USB MIDI
+ *                                    clock, start (continue too) and stop in, at once
  *   player_audio(out, n)             in the audio ISR: n stereo frames, Q15, interleaved L R
  *   player_track_name(track)         the chip and channel track 0..3 plays, as the screen names it ("NES · PULSE 1")
  * A new project's tracks 1 to 4 play NES Pulse 1, Pulse 2, Triangle and Noise (ADR 0002: one shared 2A03).
@@ -50,13 +52,25 @@
  * volume is scaled by. A new note keeps the lasting effects, its slide starts from its own pitch.
  * A live note held on a track sounds over what the pattern plays there, with its own instrument, at full row
  * volume; its key up silences it and gives the channel back to the pattern. The noise's period comes from the note
- * as in FamiTracker: 15 - note mod 16, so a higher note a shorter period, wrapping every 16 notes. */
+ * as in FamiTracker: 15 - note mod 16, so a higher note a shorter period, wrapping every 16 notes.
+ * MIDI clock in (24 pulses a quarter) drives the rows instead of the tempo while it comes: after a MIDI start (it
+ * plays from the current entry's first row, as player_play) the first pulse is row 0's, every 6th pulse after it
+ * starts the next row; a MIDI stop stops. Half a second without a pulse, the tempo drives the rows again (from the
+ * row's start). MIDI out (usb.c's ring): while it plays on its own tempo, a MIDI start, then a clock pulse with row
+ * 0 and every 1 / 24 quarter after it (every 6th with a row), a MIDI stop when it stops; nothing of it following
+ * MIDI clock in. Each track's note as its channel plays it (a live note over the pattern's) goes out on MIDI channel
+ * 1 .. 4 with the row volume as velocity (0..F: 0..127, at least 1), its note off when it ends (a cut, a release, a
+ * new note, the live note over it, stop). */
 #define PLAYER_TRACKS 4u
 #define PLAYER_PULSE1 0u                 /* the tracks' channels */
 #define PLAYER_PULSE2 1u
 #define PLAYER_TRIANGLE 2u
 #define PLAYER_NOISE 3u
 #define PLAYER_ROW_UNITS (FS * 15u)      /* a row: FS * 60 / (4 BPM) samples = PLAYER_ROW_UNITS / BPM */
+#define PLAYER_PULSE_UNITS (PLAYER_ROW_UNITS / 6u)   /* a MIDI clock pulse: 24 a quarter, 6 a row */
+_Static_assert(PLAYER_ROW_UNITS % 6u == 0, "a row is 6 whole pulses");
+#define PLAYER_EXT_HOLD (FS / 2u)        /* MIDI clock in drives the rows until half a second without a pulse */
+#define PLAYER_EXT_FIRST 0xFFu           /* player.etick: started, the first pulse (row 0's) to come */
 #define PLAYER_REQ_PLAY 1u
 #define PLAYER_REQ_STOP 2u
 
@@ -101,6 +115,7 @@ typedef struct {                         /* what plays on a track: the pattern's
     uint8_t ins;                         /* the instrument playing, 0..15 or PLAYER_NO_INS */
     uint8_t vol;                         /* the row volume, Q3: 0..PLAYER_VOL_MAX */
     uint8_t released;
+    uint8_t starts;                      /* its notes started (MIDI out tells a note started again from one held) */
     uint8_t effect, effect_p;                    /* the lasting pitch effect (PLAYER_EFFECT_*) and its parameter */
     uint8_t arp_state;                   /* 0xy: 0 the note, 1 + x, 2 + y */
     int8_t effect_arp;                       /* 0xy: the semitones it adds this frame */
@@ -135,7 +150,11 @@ static struct {
     uint8_t jump, skip;                  /* the row's Bxx entry and Dxx row, or PLAYER_NO_JUMP */
     uint16_t bpm, bpm_seen;              /* the tempo playing (Fxx sets it), the project's as last seen */
     uint8_t count;                       /* the main loop's note-on count */
+    uint32_t sent[PLAYER_TRACKS];        /* the audio ISR's: each track's note on on MIDI out (player_midi_notes) */
     uint32_t acc;                        /* the row's time so far, in 1 / BPM samples */
+    uint32_t pacc;                       /* .. the MIDI clock pulse's */
+    uint32_t ext;                        /* MIDI clock in: the samples it still drives the rows for (0: the tempo) */
+    uint8_t etick;                       /* .. the row's pulses so far (PLAYER_EXT_FIRST: none since the start) */
     int32_t mono[CTL];
 } player;
 
@@ -172,7 +191,7 @@ static void player_init(void)
     nes_init(&player.nes);
     memset(player.voice, 0, sizeof player.voice);
     for (i = 0; i < PLAYER_TRACKS; i++) {
-        player.live[i] = player.live_seen[i] = 0;
+        player.live[i] = player.live_seen[i] = player.sent[i] = 0;
         player.ins[i] = PLAYER_NO_INS;
         player.voice[i][0].vol = player.voice[i][1].vol = PLAYER_VOL_MAX;
         player.voice[i][0].def_duty = player.voice[i][1].def_duty = i == PLAYER_NOISE ? 0u : 2u;
@@ -323,6 +342,7 @@ static void player_voice_start(uint32_t t, player_voice_t *v, uint32_t note, uin
 {
     uint32_t s;
     v->note = (uint8_t)(note + 1u);
+    v->starts++;
     v->ins = (uint8_t)(ins < PROJECT_INSTRUMENTS && project_ins_chip(ins) == PROJECT_CHIP_NES ? ins : PLAYER_NO_INS);
     v->released = 0;
     v->s_vol = 15;
@@ -540,17 +560,95 @@ static __attribute__((noinline)) void player_transport(void)   /* the audio ISR:
         player.ins[t] = PLAYER_NO_INS;
         player.delay[t] = player.cut[t] = PLAYER_NO_FRAME;
     }
-    player.acc = 0;
+    player.acc = player.pacc = 0;
+    player.etick = PLAYER_EXT_FIRST;
     player.bpm = player.bpm_seen = (uint16_t)project_bpm();
+    if (player.playing && player.req == PLAYER_REQ_STOP && !player.ext)
+        midi_out_event(0x0Fu | 0xFCu << 8);   /* MIDI stop (following MIDI clock in: none) */
     player.playing = player.req == PLAYER_REQ_PLAY;
-    if (player.playing)
+    if (player.playing) {
+        if (!player.ext) {
+            midi_out_event(0x0Fu | 0xFAu << 8);   /* MIDI start, the first pulse with row 0 */
+            midi_out_event(0x0Fu | 0xF8u << 8);
+        }
         player_row_start(project_entry(), 0);
+    }
     player.req = 0;                      /* (last: player_playing / player_row read the request until then) */
+}
+
+/* MIDI in (the audio ISR, before player_audio): start (continue too: V-Track has no song position) and stop act at
+ * once; a clock pulse after the start's first starts the next row every 6th */
+static void player_midi_start(void)
+{
+    player.ext = PLAYER_EXT_HOLD;
+    player.req = PLAYER_REQ_PLAY;
+    player_transport();
+}
+
+static void player_midi_stop(void)
+{
+    player.ext = PLAYER_EXT_HOLD;
+    if (player.playing) {
+        player.req = PLAYER_REQ_STOP;
+        player_transport();
+    }
+}
+
+static void player_midi_clock(void)
+{
+    player.ext = PLAYER_EXT_HOLD;
+    if (!player.playing || player.req)
+        return;
+    if (player.etick == PLAYER_EXT_FIRST) {
+        player.etick = 0;
+    } else if (++player.etick >= 6u) {
+        player.etick = 0;
+        player_next_row();
+    }
 }
 
 static const player_voice_t *player_sounding(uint32_t t)   /* track t's channel: the live note over the pattern's */
 {
     return player.voice[t][1].note ? &player.voice[t][1] : &player.voice[t][0];
+}
+
+/* the audio ISR, once a block: each track's note as its channel plays it (the live note over the pattern's), on MIDI
+ * channel 1 .. 4 with the row volume as velocity; a note that ends (cut, release, a new note, stop), its note off */
+static __attribute__((noinline)) void player_midi_notes(void)
+{
+    uint32_t t;
+    for (t = 0; t < PLAYER_TRACKS; t++) {
+        const player_voice_t *v = player_sounding(t);
+        uint32_t note = v->released ? 0u : v->note, was = player.sent[t],
+                 key = note ? note | (uint32_t)v->starts << 8 | (uint32_t)(v == &player.voice[t][1]) << 16 : 0u;
+        if (key == was)
+            continue;
+        player.sent[t] = key;
+        if (was)
+            midi_out_event(0x08u | (0x80u | t) << 8 | ((was & 0xFFu) - 1u) << 16);
+        if (note) {
+            uint32_t vel = (v->vol >> 3) * 127u / 15u;
+            midi_out_event(0x09u | (0x90u | t) << 8 | (note - 1u) << 16 | (vel ? vel : 1u) << 24);
+        }
+    }
+}
+
+/* the audio ISR, once a block: the row's time; MIDI clock in drives the rows instead while it comes
+ * (player_midi_clock), else the tempo does, with a MIDI clock pulse out every 1 / 6 row */
+static __attribute__((noinline)) void player_tempo(uint32_t k)
+{
+    if (player.ext) {
+        player.ext = player.ext > k ? player.ext - k : 0u;
+    } else if (player.playing) {
+        if ((player.pacc += k * player.bpm) >= PLAYER_PULSE_UNITS) {
+            player.pacc -= PLAYER_PULSE_UNITS;   /* (in step with the rows: every 6th pulse starts one) */
+            midi_out_event(0x0Fu | 0xF8u << 8);
+        }
+        if ((player.acc += k * player.bpm) >= PLAYER_ROW_UNITS) {
+            player.acc -= PLAYER_ROW_UNITS;
+            player_next_row();
+        }
+    }
 }
 
 static void player_audio(int32_t *out, uint32_t n)
@@ -562,6 +660,7 @@ static void player_audio(int32_t *out, uint32_t n)
         const player_voice_t *v1, *v2, *vt, *vn;
         k = n < CTL ? n : CTL;
         player_voices(k);
+        player_midi_notes();
         v1 = player_sounding(PLAYER_PULSE1);
         v2 = player_sounding(PLAYER_PULSE2);
         vt = player_sounding(PLAYER_TRIANGLE);
@@ -582,9 +681,6 @@ static void player_audio(int32_t *out, uint32_t n)
         /* the row's time is up: the next row from the next block on */
         if (project_bpm() != player.bpm_seen)   /* K4: the project's tempo, over Fxx's */
             player.bpm = player.bpm_seen = (uint16_t)project_bpm();
-        if (player.playing && (player.acc += k * player.bpm) >= PLAYER_ROW_UNITS) {
-            player.acc -= PLAYER_ROW_UNITS;
-            player_next_row();
-        }
+        player_tempo(k);
     }
 }

@@ -23,7 +23,8 @@
  *   sim_encoder(e, steps)     encoder K1..K8 = 0..7 turned by steps detents (+ clockwise)
  *   sim_fader(f, v)           fader 0..3 at 0..127
  *   sim_wheel(w, raw)         pitch wheel (0) / mod wheel (1) at its raw reading 0..1023
- *   sim_midi_in(st, d1, d2)   a USB MIDI channel message from the host; 0 if the device's ring was full
+ *   sim_midi_in(st, d1, d2)   a USB MIDI channel message (or clock, start, continue, stop: F8 FA FB FC) from the
+ *                             host; 0 if the device's ring was full
  *   sim_midi_out(pkts, max)   USB-MIDI event packets the device sent since the last call
  *   sim_audio(&frames)        stereo frames (L R interleaved, 24-bit) rendered since the last call
  *   sim_frame()               the screen: 240 x 240 RGB565 (row by row)
@@ -287,6 +288,7 @@ static void sim_power_on(void)
         sim_nor_init = 1;
     }
     vt_boot();
+    usb.config = 1;                          /* a USB host, the device configured: MIDI out is sent */
     sim_booted = 1;
     sim_last_frame = fm1_ms - 15u;
 }
@@ -347,6 +349,8 @@ static void sim_wheel(uint32_t w, uint32_t raw) { if (w < 2u) fm1_in.wheel[w] = 
 
 static int sim_midi_in(uint8_t st, uint8_t d1, uint8_t d2)   /* as usb.c ep1_rx takes a received packet */
 {
+    if (st == 0xF8u || st == 0xFAu || st == 0xFBu || st == 0xFCu)   /* real time: clock, start, continue, stop */
+        return midi_enqueue(0xFu | (uint32_t)st << 8, 1);
     if (st < 0x80u || st >= 0xF0u)
         return 1;
     return midi_enqueue((uint32_t)(st >> 4) | (uint32_t)st << 8 | (uint32_t)(d1 & 127u) << 16 |
